@@ -1,6 +1,6 @@
-# Codex-C 终端管理脚本说明
+# Codex-Core 终端管理脚本说明
 
-`codex-c` 是一个用于管理 Codex 配置的交互式 Bash 脚本，支持面板展示、API/模型管理、Prompt/Skill 目录管理、MCP 配置管理，以及服务重载等操作。
+`codex-core` 是一个用于管理 Codex 配置的交互式 Bash 脚本，支持面板展示、API/模型管理、Prompt/Skill 目录管理、MCP 配置管理，以及服务重载等操作。
 
 ## 功能概览
 - 启动面板：显示运行状态、版本、配置路径、当前 API/模型、MCP/Skill 数量
@@ -31,7 +31,7 @@
 ## 安装与全局命令
 推荐把脚本加入 PATH：
 ```bash
-sudo ln -s /data/projects/codex-c脚本/codex-c /usr/local/bin/cx
+sudo ln -s /data/projects/codex-c脚本/codex-core /usr/local/bin/cx
 ```
 然后运行：
 ```bash
@@ -45,7 +45,7 @@ cx
 CONFIG_PATH=/root/.codex/config.toml cx
 ```
 ```bash
-CONFIG_PATH=/root/.codex/config.toml codex-c
+CONFIG_PATH=/root/.codex/config.toml codex-core
 ```
 
 常用环境变量：
