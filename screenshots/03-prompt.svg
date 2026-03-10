@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="176" height="158" viewBox="0 0 176 158">
+  <rect width="100%" height="100%" fill="#0f111a" />
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="14" fill="#e6e6e6">
+    <text x="16" y="30">提示词 (Prompt) 管理:</text>
+    <text x="16" y="48">1. 查看当前系统提示词</text>
+    <text x="16" y="66">2. 快速追加提示词</text>
+    <text x="16" y="84">3. Vim 深度编辑</text>
+    <text x="16" y="102">0. 返回主菜单</text>
+    <text x="16" y="120">当前系统提示词:</text>
+    <text x="16" y="138">你是一个高效、可靠的编程助手。</text>
+  </g>
+</svg>

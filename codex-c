@@ -1,0 +1,3290 @@
+#!/usr/bin/env bash
+# Codex CLI 管理脚本
+
+DEFAULT_CONFIG_PATH="/path/to/config.json"
+CONFIG_PATH="${CONFIG_PATH:-$DEFAULT_CONFIG_PATH}"
+CONFIG_FORMAT="${CONFIG_FORMAT:-auto}" # auto | json | toml
+AUTH_PATH="${AUTH_PATH:-/root/.codex/auth.json}"
+CODEX_DIR="${CODEX_DIR:-}"
+PROMPTS_DIR="${PROMPTS_DIR:-}"
+SKILLS_DIR="${SKILLS_DIR:-}"
+MCP_DIR="${MCP_DIR:-}"
+MCP_FILE_EXT="${MCP_FILE_EXT:-.json}"
+API_PROFILES_PATH="${API_PROFILES_PATH:-}"
+USE_COLOR="${USE_COLOR:-1}"
+USE_FZF="${USE_FZF:-0}"
+UI_ASCII="${UI_ASCII:-1}"
+TRASH_DIR="${TRASH_DIR:-}"
+MOBILE_MODE="${MOBILE_MODE:-auto}"
+UI_INDENT="${UI_INDENT:-0}"
+MCP_MODE="${MCP_MODE:-config}"
+
+# 可按需修改这些 JSON 路径
+API_URL_PATH='.api.url'
+API_TOKEN_PATH='.api.token'
+MODEL_PATH='.model'
+PROMPT_PATH='.prompt'
+MCP_PATH='.mcp'
+SKILL_PATH='.skills'
+
+# TOML 配置常用路径
+TOML_PROVIDER_PATH='.model_provider'
+TOML_MODEL_PATH='.model'
+TOML_PROMPT_PATH='.prompt'
+
+# 常见字段候选（用于自动探测）
+API_URL_CANDIDATES=( '.apiUrl' '.api_url' '.endpoint' '.base_url' '.baseUrl' '.api.base_url' )
+API_TOKEN_CANDIDATES=( '.api.token' '.apiToken' '.api_key' '.apiKey' '.token' )
+MODEL_CANDIDATES=( '.model' '.model_name' '.modelName' '.llm.model' '.llm_model' )
+PROMPT_CANDIDATES=( '.prompt' '.system_prompt' '.systemPrompt' '.system' )
+MCP_CANDIDATES=( '.mcp' '.mcps' '.mcp_servers' '.mcpServers' )
+SKILL_CANDIDATES=( '.skills' '.skill' '.tools' '.plugins' )
+
+# 运行状态与版本检测
+SERVICE_NAME='codex'   # 用于 pgrep 的进程名
+SERVICE_UNIT='codex'   # systemd service 名称
+CODEX_BIN='codex'      # 版本获取命令
+
+# 预设配置（可自行调整）
+OPENAI_API_URL='https://api.openai.com/v1'
+OPENAI_MODEL='gpt-4o-mini'
+ANTHROPIC_API_URL='https://api.anthropic.com'
+ANTHROPIC_MODEL='claude-3-5-sonnet'
+
+# 校验开关与参数
+ENABLE_VALIDATE=1
+MODEL_CHECK=1
+CONNECT_TIMEOUT=3
+
+AUTO_PATH_NOTES=()
+MIGRATE_DONE=0
+AUTO_MIGRATE=1
+MODEL_FETCH_ERROR=""
+AUTO_PATH_PROMPTED=0
+
+term_cols() {
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  if ! [[ "$cols" =~ ^[0-9]+$ ]]; then
+    cols=80
+  fi
+  if [ "$cols" -lt 60 ]; then
+    cols=60
+  fi
+  echo "$cols"
+}
+
+print_line() {
+  local cols
+  cols="$(term_cols)"
+  printf "%*s\n" "$cols" "" | tr ' ' '-'
+}
+
+pause() {
+  read -r -p "按回车继续..." _
+}
+
+supports_utf8() {
+  local v
+  v="$(locale 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  if echo "$v" | grep -q 'utf-8\|utf8'; then
+    return 0
+  fi
+  v="$(printf '%s %s' "${LANG-}" "${LC_ALL-}" | tr '[:upper:]' '[:lower:]')"
+  if echo "$v" | grep -q 'utf-8\|utf8'; then
+    return 0
+  fi
+  return 1
+}
+
+init_ui() {
+  if ! supports_utf8; then
+    USE_COLOR=0
+    USE_FZF=0
+    UI_ASCII=1
+  fi
+  if [ -n "${NO_COLOR-}" ] || [ "${TERM-}" = "dumb" ]; then
+    USE_COLOR=0
+  fi
+  if [ "$USE_COLOR" = "1" ] && ! tput setaf 1 >/dev/null 2>&1; then
+    USE_COLOR=0
+  fi
+  if [ "$USE_COLOR" = "1" ]; then
+    local colors
+    colors="$(tput colors 2>/dev/null || echo 0)"
+    if ! [[ "$colors" =~ ^[0-9]+$ ]] || [ "$colors" -lt 8 ]; then
+      USE_COLOR=0
+    fi
+  fi
+  if [ "$USE_COLOR" = "1" ] && [ -t 1 ]; then
+    C_RESET=$'\033[0m'
+    C_DIM=$'\033[2m'
+    C_BOLD=$'\033[1m'
+    C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_MAGENTA=$'\033[35m'
+    C_BLUE=$'\033[34m'
+  else
+    C_RESET=""
+    C_DIM=""
+    C_BOLD=""
+    C_CYAN=""
+    C_GREEN=""
+    C_YELLOW=""
+    C_MAGENTA=""
+    C_BLUE=""
+  fi
+}
+
+strip_ansi() {
+  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+}
+
+visible_len() {
+  local input
+  input="$(printf "%s" "$1" | strip_ansi)"
+  printf "%s" "$input" | awk '{print length}'
+}
+
+pad_right() {
+  local text="$1"
+  local width="$2"
+  local len
+  if ! [[ "$width" =~ ^[0-9]+$ ]]; then
+    width=0
+  fi
+  len="$(visible_len "$text")"
+  if ! [[ "$len" =~ ^[0-9]+$ ]]; then
+    len=0
+  fi
+  if [ "$len" -gt "$width" ]; then
+    local plain
+    plain="$(printf "%s" "$text" | strip_ansi)"
+    printf "%.*s" "$width" "$plain"
+    return
+  fi
+  printf "%s%*s" "$text" "$((width - len))" ""
+}
+
+truncate_text() {
+  local text="$1"
+  local max="$2"
+  if [ -z "$max" ] || ! [[ "$max" =~ ^[0-9]+$ ]]; then
+    echo "$text"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$text" "$max" <<'PY'
+import sys
+text = sys.argv[1]
+max_len = int(sys.argv[2])
+if len(text) <= max_len:
+    print(text)
+else:
+    if max_len <= 3:
+        print(text[:max_len])
+    else:
+        print(text[:max_len-3] + "...")
+PY
+  else
+    if [ "${#text}" -le "$max" ]; then
+      echo "$text"
+    else
+      if [ "$max" -le 3 ]; then
+        echo "${text:0:$max}"
+      else
+        echo "${text:0:$((max-3))}..."
+      fi
+    fi
+  fi
+}
+
+toml_mcp_list_names() {
+  sed -n 's/^\[mcp_servers\.\([^]]\+\)\]/\1/p' "$CONFIG_PATH"
+}
+
+toml_mcp_list_disabled_names() {
+  sed -n 's/^\[mcp_servers_disabled\.\([^]]\+\)\]/\1/p' "$CONFIG_PATH"
+}
+
+toml_mcp_has_name() {
+  local name="$1"
+  grep -q "^\\[mcp_servers\\.${name}\\]$" "$CONFIG_PATH"
+}
+
+toml_mcp_has_disabled_name() {
+  local name="$1"
+  grep -q "^\\[mcp_servers_disabled\\.${name}\\]$" "$CONFIG_PATH"
+}
+
+toml_mcp_get_block() {
+  local name="$1"
+  awk -v name="$name" '
+    $0 ~ "^\\[mcp_servers\\."name"\\]$" {inside=1; print; next}
+    /^\[/ { if(inside){exit} }
+    { if(inside) print }
+  ' "$CONFIG_PATH"
+}
+
+toml_mcp_get_block_disabled() {
+  local name="$1"
+  awk -v name="$name" '
+    $0 ~ "^\\[mcp_servers_disabled\\."name"\\]$" {inside=1; print; next}
+    /^\[/ { if(inside){exit} }
+    { if(inside) print }
+  ' "$CONFIG_PATH"
+}
+
+toml_mcp_remove_block() {
+  local name="$1"
+  awk -v name="$name" '
+    $0 ~ "^\\[mcp_servers\\."name"\\]$" {inside=1; next}
+    /^\[/ { if(inside){inside=0} }
+    { if(!inside) print }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+toml_mcp_remove_block_disabled() {
+  local name="$1"
+  awk -v name="$name" '
+    $0 ~ "^\\[mcp_servers_disabled\\."name"\\]$" {inside=1; next}
+    /^\[/ { if(inside){inside=0} }
+    { if(!inside) print }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+toml_mcp_remove_any_block() {
+  local name="$1"
+  toml_mcp_remove_block "$name"
+  toml_mcp_remove_block_disabled "$name"
+}
+
+toml_mcp_disable_name() {
+  local name="$1"
+  sed -i "s/^\\[mcp_servers\\.${name}\\]/[mcp_servers_disabled.${name}]/" "$CONFIG_PATH"
+}
+
+toml_mcp_enable_name() {
+  local name="$1"
+  sed -i "s/^\\[mcp_servers_disabled\\.${name}\\]/[mcp_servers.${name}]/" "$CONFIG_PATH"
+}
+
+toml_mcp_disable_all() {
+  sed -i "s/^\\[mcp_servers\\./[mcp_servers_disabled./" "$CONFIG_PATH"
+}
+
+toml_mcp_enable_all() {
+  sed -i "s/^\\[mcp_servers_disabled\\./[mcp_servers./" "$CONFIG_PATH"
+}
+
+toml_headers_inline_from_json() {
+  local json="$1"
+  if [ -z "$json" ]; then
+    echo ""
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo ""
+    return 1
+  fi
+  python3 - "$json" <<'PY'
+import json, sys
+raw = sys.argv[1]
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+parts = []
+for k, v in data.items():
+    if isinstance(v, str):
+        v = v.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'{k} = "{v}"')
+    elif isinstance(v, bool):
+        parts.append(f'{k} = {"true" if v else "false"}')
+    else:
+        parts.append(f'{k} = {json.dumps(v)}')
+print("{ " + ", ".join(parts) + " }")
+PY
+}
+
+toml_mcp_add_or_update() {
+  local name="$1"
+  local url="$2"
+  local headers_inline="$3"
+  backup_config
+  toml_mcp_remove_any_block "$name"
+  local escaped_url
+  escaped_url="$(sed_escape "$url")"
+  {
+    printf "\n[mcp_servers.%s]\n" "$name"
+    printf "url = \"%s\"\n" "$escaped_url"
+    if [ -n "$headers_inline" ]; then
+      printf "headers = %s\n" "$headers_inline"
+    fi
+  } >> "$CONFIG_PATH"
+}
+
+toml_mcp_add_raw_block() {
+  local name="$1"
+  local block="$2"
+  backup_config
+  toml_mcp_remove_any_block "$name"
+  printf "\n%s\n" "$block" >> "$CONFIG_PATH"
+}
+
+toml_mcp_replace_block() {
+  local old_name="$1"
+  local new_name="$2"
+  local block="$3"
+  backup_config
+  toml_mcp_remove_any_block "$old_name"
+  if [ "$new_name" != "$old_name" ]; then
+    toml_mcp_remove_any_block "$new_name"
+  fi
+  printf "\n%s\n" "$block" >> "$CONFIG_PATH"
+}
+
+toml_mcp_count() {
+  require_python || { echo "0"; return; }
+  python3 - "$CONFIG_PATH" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as f:
+    data = tomllib.load(f)
+srv = data.get("mcp_servers")
+if isinstance(srv, dict):
+    print(len(srv))
+else:
+    print(0)
+PY
+}
+
+prompt_symbol() {
+  if [ "$UI_ASCII" = "1" ]; then
+    echo ">"
+  else
+    echo "❯"
+  fi
+}
+
+menu_icon() {
+  echo ""
+}
+
+indent_prefix() {
+  local n="${UI_INDENT:-0}"
+  if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+    n=0
+  fi
+  printf "%*s" "$n" ""
+}
+
+color_wrap() {
+  local color="$1"
+  local text="$2"
+  if [ -n "$color" ]; then
+    printf "%s%s%s" "$color" "$text" "$C_RESET"
+  else
+    printf "%s" "$text"
+  fi
+}
+
+is_mobile() {
+  case "${MOBILE_MODE,,}" in
+    1|true|yes) return 0 ;;
+    0|false|no) return 1 ;;
+  esac
+  local cols
+  cols="$(term_cols)"
+  [ "$cols" -le 70 ]
+}
+
+ui_logo() {
+  local CYAN PURPLE NC
+  CYAN="$C_CYAN"
+  PURPLE="$C_MAGENTA"
+  NC="$C_RESET"
+  echo -e "${CYAN}  ____ ___  ____  _____ __  __ ${NC}"
+  echo -e "${CYAN} / ___/ _ \\|  _ \\| ____|\\ \\/ / ${NC}"
+  echo -e "${CYAN}| |  | | | | | | |  _|   \\  /  ${NC}"
+  echo -e "${CYAN}| |__| |_| | |_| | |___  /  \\  ${NC}"
+  echo -e "${CYAN} \\____\\___/|____/|_____|/_/\\_\\ ${NC}"
+  echo -e "${PURPLE}       [ C O R E   M A N A G E R ]${NC}"
+  echo ""
+}
+
+ui_status_box() {
+  local cols box_width inner_width max_len
+  cols="$(term_cols)"
+  box_width=50
+  if [ "$cols" -lt "$box_width" ]; then
+    box_width="$cols"
+  fi
+  if [ "$box_width" -lt 30 ]; then
+    box_width=30
+  fi
+  inner_width=$((box_width - 1))
+  max_len=$((inner_width - 2))
+
+  local hline
+  hline="$(printf "%*s" "$inner_width" "" | tr ' ' '-')"
+  if [ -n "$C_DIM" ]; then
+    printf "%s+%s%s\n" "$C_DIM" "$hline" "$C_RESET"
+  else
+    printf "+%s\n" "$hline"
+  fi
+  while [ "$#" -gt 0 ]; do
+    local line
+    line="$(truncate_text "$1" "$max_len")"
+    if [ -n "$C_DIM" ]; then
+      printf "%s|%s %s\n" "$C_DIM" "$C_RESET" "$line"
+    else
+      printf "| %s\n" "$line"
+    fi
+    shift
+  done
+  if [ -n "$C_DIM" ]; then
+    printf "%s+%s%s\n" "$C_DIM" "$hline" "$C_RESET"
+  else
+    printf "+%s\n" "$hline"
+  fi
+}
+
+use_fzf() {
+  false
+}
+
+menu_choose() {
+  local title="$1"
+  shift
+  local items=("$@")
+  local idx_map=()
+  if use_fzf; then
+    local list=()
+    local i=1
+    local item
+    for item in "${items[@]}"; do
+      local idx="$i"
+      if [[ "$item" =~ ^(返回|退出) ]]; then
+        idx=0
+      fi
+      idx_map+=( "$idx" )
+      list+=( "$(printf '%s%2d%s %s' "$C_MAGENTA" "$idx" "$C_RESET" "$item")" )
+      i=$((i + 1))
+    done
+    local selection
+    local fzf_opts=(--prompt "$title > " --height 40% --border --reverse --no-multi --no-unicode)
+    if [ "$USE_COLOR" = "1" ]; then
+      fzf_opts+=(--ansi)
+    fi
+    if [ "$UI_ASCII" = "1" ]; then
+      fzf_opts+=(--no-unicode)
+    fi
+    selection="$(printf '%s\n' "${list[@]}" | fzf "${fzf_opts[@]}")"
+    if [ -z "$selection" ]; then
+      echo ""
+      return 1
+    fi
+    if [[ "$selection" =~ ([0-9]+) ]]; then
+      echo "${BASH_REMATCH[1]}"
+      return 0
+    fi
+    return 1
+  else
+    printf "%s%s%s\n" "$C_BOLD$C_BLUE" "$title" "$C_RESET" >&2
+    local i=1
+    local item
+    for item in "${items[@]}"; do
+      local idx="$i"
+      if [[ "$item" =~ ^(返回|退出) ]]; then
+        idx=0
+      fi
+      idx_map+=( "$idx" )
+      if [ -n "$C_CYAN" ]; then
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" "$idx" "$C_RESET" "$item" >&2
+      else
+        printf "[ %d ] %s\n" "$idx" "$item" >&2
+      fi
+      i=$((i + 1))
+    done
+    read -r -p "codex-core $(prompt_symbol) 请输入对应数字选择: " choice
+    echo "$choice"
+  fi
+}
+
+require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "未检测到 jq，无法读取或修改 JSON 配置。请先安装 jq。"
+    return 1
+  fi
+  return 0
+}
+
+require_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "未检测到 python3，无法解析 TOML 配置。请先安装 python3。"
+    return 1
+  fi
+  return 0
+}
+
+auto_detect_config_path() {
+  if [ "$CONFIG_PATH" != "$DEFAULT_CONFIG_PATH" ]; then
+    return 0
+  fi
+  if [ -f "/root/.codex/config.toml" ]; then
+    CONFIG_PATH="/root/.codex/config.toml"
+  elif [ -f "/root/.codex/config.json" ]; then
+    CONFIG_PATH="/root/.codex/config.json"
+  else
+    local candidates=()
+    local cand
+    candidates+=( "$HOME/.codex/config.toml" "$HOME/.codex/config.json" )
+    for cand in /home/*/.codex/config.toml /home/*/.codex/config.json; do
+      candidates+=( "$cand" )
+    done
+    for cand in "${candidates[@]}"; do
+      if [ -f "$cand" ]; then
+        CONFIG_PATH="$cand"
+        return 0
+      fi
+    done
+    if [ "$AUTO_PATH_PROMPTED" = "0" ]; then
+      AUTO_PATH_PROMPTED=1
+      echo "未自动找到 codex 配置目录。"
+      read -r -p "请输入 .codex 目录路径（留空跳过）： " user_dir
+      if [ -n "$user_dir" ]; then
+        if [ -f "$user_dir/config.toml" ]; then
+          CONFIG_PATH="$user_dir/config.toml"
+        elif [ -f "$user_dir/config.json" ]; then
+          CONFIG_PATH="$user_dir/config.json"
+        else
+          echo "未在该目录找到 config.toml 或 config.json。"
+        fi
+      fi
+    fi
+  fi
+}
+
+sync_codex_dirs() {
+  if [ -z "$CODEX_DIR" ]; then
+    if [ -n "$CONFIG_PATH" ] && [ -e "$CONFIG_PATH" ]; then
+      CODEX_DIR="$(dirname "$CONFIG_PATH")"
+    elif [ -d "/root/.codex" ]; then
+      CODEX_DIR="/root/.codex"
+    else
+      CODEX_DIR="$(pwd)"
+    fi
+  fi
+
+  if [ -z "$PROMPTS_DIR" ]; then
+    PROMPTS_DIR="$CODEX_DIR/prompts"
+  fi
+  if [ -z "$SKILLS_DIR" ]; then
+    SKILLS_DIR="$CODEX_DIR/skills"
+  fi
+  if [ -z "$MCP_DIR" ]; then
+    MCP_DIR="$CODEX_DIR/mcp"
+  fi
+  if [ -z "$API_PROFILES_PATH" ]; then
+    API_PROFILES_PATH="$CODEX_DIR/api_profiles.json"
+  fi
+  if [ -z "$TRASH_DIR" ]; then
+    TRASH_DIR="$CODEX_DIR/trash"
+  fi
+}
+
+ensure_dir() {
+  local dir="$1"
+  local label="$2"
+  if [ -d "$dir" ]; then
+    return 0
+  fi
+  echo "$label 目录不存在：$dir"
+  read -r -p "是否创建？[y/N] " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    mkdir -p "$dir" || {
+      echo "创建失败：$dir"
+      return 1
+    }
+    return 0
+  fi
+  return 1
+}
+
+trash_move() {
+  local src="$1"
+  local label="$2"
+  sync_codex_dirs
+  ensure_dir "$TRASH_DIR" "Trash" || return 1
+  if [ ! -e "$src" ]; then
+    echo "未找到：$src"
+    return 1
+  fi
+  local base ts dest
+  base="$(basename "$src")"
+  ts="$(date +%Y%m%d_%H%M%S)"
+  dest="$TRASH_DIR/${label}-${base}-${ts}"
+  mv "$src" "$dest" && echo "已移动到回收站：$dest"
+}
+
+normalize_name() {
+  local name="$1"
+  name="${name//\\/}"
+  name="${name//\//}"
+  name="${name// /-}"
+  echo "$name"
+}
+
+prompt_path_from_name() {
+  local name
+  name="$(normalize_name "$1")"
+  if [[ "$name" != *.md ]]; then
+    name="${name}.md"
+  fi
+  echo "$PROMPTS_DIR/$name"
+}
+
+skill_dir_from_name() {
+  local name
+  name="$(normalize_name "$1")"
+  echo "$SKILLS_DIR/$name"
+}
+
+mcp_path_from_name() {
+  local name
+  name="$(normalize_name "$1")"
+  if [[ "$name" != *"$MCP_FILE_EXT" ]]; then
+    name="${name}${MCP_FILE_EXT}"
+  fi
+  echo "$MCP_DIR/$name"
+}
+
+detect_config_format() {
+  if [ "$CONFIG_FORMAT" = "json" ] || [ "$CONFIG_FORMAT" = "toml" ]; then
+    return 0
+  fi
+  case "$CONFIG_PATH" in
+    *.toml) CONFIG_FORMAT="toml" ;;
+    *.json) CONFIG_FORMAT="json" ;;
+    *)
+      if command -v jq >/dev/null 2>&1 && jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
+        CONFIG_FORMAT="json"
+      elif command -v python3 >/dev/null 2>&1; then
+        if python3 - <<'PY' "$CONFIG_PATH" >/dev/null 2>&1
+import sys, tomllib
+with open(sys.argv[1], 'rb') as f:
+    tomllib.load(f)
+PY
+        then
+          CONFIG_FORMAT="toml"
+        else
+          CONFIG_FORMAT="json"
+        fi
+      else
+        CONFIG_FORMAT="json"
+      fi
+      ;;
+  esac
+}
+
+restore_backup() {
+  if [ -f "$CONFIG_PATH.bak" ]; then
+    cp -f "$CONFIG_PATH.bak" "$CONFIG_PATH"
+    echo "校验失败，已自动回滚到 $CONFIG_PATH.bak"
+  else
+    echo "校验失败，但未找到备份文件，无法回滚。"
+  fi
+  if [ -f "$AUTH_PATH.bak" ]; then
+    cp -f "$AUTH_PATH.bak" "$AUTH_PATH"
+    echo "已回滚鉴权文件到 $AUTH_PATH.bak"
+  fi
+}
+
+validate_or_rollback() {
+  if ! validate_api_model; then
+    restore_backup
+    return 1
+  fi
+  return 0
+}
+
+ensure_config() {
+  auto_detect_config_path
+  detect_config_format
+  if [ ! -f "$CONFIG_PATH" ]; then
+    echo "配置文件不存在：$CONFIG_PATH"
+    read -r -p "是否创建空配置文件 {} ？[y/N] " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      if [ "$CONFIG_FORMAT" = "toml" ]; then
+        printf '' > "$CONFIG_PATH"
+      else
+        printf '{}' > "$CONFIG_PATH"
+      fi
+      echo "已创建空配置文件。"
+    else
+      return 1
+    fi
+  fi
+  if [ "$CONFIG_FORMAT" = "json" ]; then
+    if ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
+      echo "配置文件不是有效 JSON：$CONFIG_PATH"
+      return 1
+    fi
+  else
+    require_python || return 1
+    if ! python3 - <<'PY' "$CONFIG_PATH" >/dev/null 2>&1
+import sys, tomllib
+with open(sys.argv[1], 'rb') as f:
+    tomllib.load(f)
+PY
+    then
+      echo "配置文件不是有效 TOML：$CONFIG_PATH"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+backup_config() {
+  if [ -f "$CONFIG_PATH" ]; then
+    cp -f "$CONFIG_PATH" "$CONFIG_PATH.bak"
+  fi
+}
+
+backup_auth() {
+  if [ -f "$AUTH_PATH" ]; then
+    cp -f "$AUTH_PATH" "$AUTH_PATH.bak"
+  fi
+}
+
+sed_escape() {
+  printf '%s' "$1" | sed -e 's/[\\/&"]/\\&/g'
+}
+
+toml_replace_model() {
+  local value="$1"
+  local escaped
+  escaped="$(sed_escape "$value")"
+  if grep -q '^model = ' "$CONFIG_PATH"; then
+    sed -i "s/^model = .*/model = \"${escaped}\"/" "$CONFIG_PATH"
+    return 0
+  fi
+  echo "未找到 model 行，无法修改。"
+  return 1
+}
+
+toml_replace_base_url() {
+  local provider="$1"
+  local value="$2"
+  local escaped
+  escaped="$(sed_escape "$value")"
+  if grep -q "^\\[model_providers\\.${provider}\\]" "$CONFIG_PATH"; then
+    sed -i "/^\\[model_providers\\.${provider}\\]/,/^\\[/{s|^base_url = .*|base_url = \"${escaped}\"|}" "$CONFIG_PATH"
+    return 0
+  fi
+  if grep -q '^base_url = ' "$CONFIG_PATH"; then
+    sed -i "s|^base_url = .*|base_url = \"${escaped}\"|" "$CONFIG_PATH"
+    return 0
+  fi
+  echo "未找到 base_url 行，无法修改。"
+  return 1
+}
+
+path_to_jq_array() {
+  local path="$1"
+  local stripped="${path#.}"
+  IFS='.' read -r -a parts <<< "$stripped"
+  local json='['
+  local part
+  for part in "${parts[@]}"; do
+    if [ -n "$part" ]; then
+      json+="\"$part\","
+    fi
+  done
+  json="${json%,}]"
+  echo "$json"
+}
+
+get_json_value() {
+  local path="$1"
+  jq -r "$path // empty" "$CONFIG_PATH" 2>/dev/null
+}
+
+json_exists() {
+  local path="$1"
+  jq -e "$path != null" "$CONFIG_PATH" >/dev/null 2>&1
+}
+
+get_toml_value() {
+  local path="$1"
+  require_python || return 1
+  python3 - "$CONFIG_PATH" "$path" <<'PY'
+import sys, json, tomllib
+cfg_path = sys.argv[1]
+path = sys.argv[2].lstrip('.')
+parts = [p for p in path.split('.') if p]
+with open(cfg_path, 'rb') as f:
+    data = tomllib.load(f)
+cur = data
+for p in parts:
+    if isinstance(cur, dict) and p in cur:
+        cur = cur[p]
+    else:
+        print("")
+        sys.exit(0)
+if cur is None:
+    print("")
+elif isinstance(cur, (dict, list)):
+    print(json.dumps(cur, ensure_ascii=False))
+else:
+    print(cur)
+PY
+}
+
+toml_exists() {
+  local path="$1"
+  require_python || return 1
+  python3 - "$CONFIG_PATH" "$path" <<'PY'
+import sys, tomllib
+cfg_path = sys.argv[1]
+path = sys.argv[2].lstrip('.')
+parts = [p for p in path.split('.') if p]
+with open(cfg_path, 'rb') as f:
+    data = tomllib.load(f)
+cur = data
+for p in parts:
+    if isinstance(cur, dict) and p in cur:
+        cur = cur[p]
+    else:
+        print("0")
+        sys.exit(0)
+print("1")
+PY
+}
+
+toml_escape() {
+  local value="$1"
+  python3 - "$value" <<'PY'
+import sys
+v = sys.argv[1]
+if "\n" in v:
+    v = v.replace('"""', '\\"""')
+    print('"""' + v + '"""')
+else:
+    v = v.replace('\\', '\\\\').replace('"', '\\"')
+    print('"' + v + '"')
+PY
+}
+
+toml_set_value() {
+  local path="$1"
+  local value="$2"
+  require_python || return 1
+  local keypath="${path#.}"
+  local section="${keypath%.*}"
+  local key="${keypath##*.}"
+  local literal
+  literal="$(toml_escape "$value")"
+  python3 - "$CONFIG_PATH" "$section" "$key" "$literal" <<'PY'
+import sys, re
+cfg_path, section, key, literal = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+out = []
+current = None
+section_found = False
+key_written = False
+
+def is_section(line):
+    m = re.match(r'^\s*\[(.+?)\]\s*$', line)
+    return m.group(1) if m else None
+
+for line in lines:
+    sec = is_section(line)
+    if sec is not None:
+        if section and sec == section:
+            section_found = True
+        current = sec
+        out.append(line)
+        continue
+
+    if (not section and current is None) or (section and current == section):
+        if re.match(r'^\s*' + re.escape(key) + r'\s*=', line):
+            out.append(f"{key} = {literal}\n")
+            key_written = True
+        else:
+            out.append(line)
+    else:
+        out.append(line)
+
+if not key_written:
+    if section:
+        if not section_found:
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            out.append(f"\n[{section}]\n")
+        inserted = False
+        new_out = []
+        current = None
+        for line in out:
+            sec = is_section(line)
+            if sec is not None:
+                if current == section and not inserted:
+                    new_out.append(f"{key} = {literal}\n")
+                    inserted = True
+                current = sec
+                new_out.append(line)
+            else:
+                new_out.append(line)
+        if current == section and not inserted:
+            new_out.append(f"{key} = {literal}\n")
+            inserted = True
+        out = new_out
+    else:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append(f"{key} = {literal}\n")
+
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    f.writelines(out)
+PY
+}
+
+get_config_value() {
+  local path="$1"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    get_toml_value "$path"
+  else
+    get_json_value "$path"
+  fi
+}
+
+config_exists() {
+  local path="$1"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    [ "$(toml_exists "$path")" = "1" ]
+  else
+    json_exists "$path"
+  fi
+}
+
+set_json_value() {
+  local path="$1"
+  local value="$2"
+  local arr
+  arr="$(path_to_jq_array "$path")"
+  jq --arg v "$value" --argjson p "$arr" 'setpath($p; $v)' \
+    "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+set_json_raw() {
+  local path="$1"
+  local raw="$2"
+  local arr
+  arr="$(path_to_jq_array "$path")"
+  jq --argjson v "$raw" --argjson p "$arr" 'setpath($p; $v)' \
+    "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+to_json_literal() {
+  local input="$1"
+  if echo "$input" | jq -e . >/dev/null 2>&1; then
+    echo "$input"
+  else
+    jq -Rn --arg v "$input" '$v'
+  fi
+}
+
+append_json_value() {
+  local path="$1"
+  local value="$2"
+  local arr
+  arr="$(path_to_jq_array "$path")"
+  jq --arg v "$value" --argjson p "$arr" '
+    def cur: (getpath($p) // "");
+    def sep: (if cur == "" then "" else "\n" end);
+    setpath($p; (cur + sep + $v))
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+set_config_value() {
+  local path="$1"
+  local value="$2"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    if [ "$path" = "$TOML_MODEL_PATH" ] || [ "$path" = ".model" ]; then
+      toml_replace_model "$value"
+      return $?
+    fi
+    if [[ "$path" == .model_providers.*.base_url ]]; then
+      local provider
+      provider="${path#.model_providers.}"
+      provider="${provider%.base_url}"
+      toml_replace_base_url "$provider" "$value"
+      return $?
+    fi
+    echo "TOML 模式下不支持修改该字段：$path"
+    return 1
+  else
+    set_json_value "$path" "$value"
+  fi
+}
+
+append_config_value() {
+  local path="$1"
+  local value="$2"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    local current
+    current="$(get_config_value "$path")"
+    if [ -z "$current" ]; then
+      set_config_value "$path" "$value"
+    else
+      set_config_value "$path" "${current}"$'\n'"${value}"
+    fi
+  else
+    append_json_value "$path" "$value"
+  fi
+}
+
+set_token_value() {
+  local value="$1"
+  if [ "$CONFIG_FORMAT" = "toml" ] && [ -f "$AUTH_PATH" ] && command -v jq >/dev/null 2>&1; then
+    local auth_key
+    local api_url provider
+    api_url="$(get_config_value "$API_URL_PATH")"
+    provider="$(detect_provider "$api_url")"
+    if [ "$provider" = "anthropic" ]; then
+      auth_key="ANTHROPIC_API_KEY"
+    else
+      auth_key="OPENAI_API_KEY"
+    fi
+    backup_auth
+    jq --arg k "$auth_key" --arg v "$value" '.[$k]=$v' "$AUTH_PATH" > "$AUTH_PATH.tmp" && mv "$AUTH_PATH.tmp" "$AUTH_PATH"
+  else
+    set_config_value "$API_TOKEN_PATH" "$value"
+  fi
+}
+
+get_current_token() {
+  local token
+  token="$(get_config_value "$API_TOKEN_PATH")"
+  if [ -z "$token" ] && [ -f "$AUTH_PATH" ] && command -v jq >/dev/null 2>&1; then
+    token="$(jq -r '.OPENAI_API_KEY // .ANTHROPIC_API_KEY // empty' "$AUTH_PATH" 2>/dev/null)"
+  fi
+  echo "$token"
+}
+
+profiles_init() {
+  require_jq || return 1
+  sync_codex_dirs
+  if [ ! -f "$API_PROFILES_PATH" ]; then
+    printf '{"profiles":{}}\n' > "$API_PROFILES_PATH" || return 1
+  fi
+  if ! jq empty "$API_PROFILES_PATH" >/dev/null 2>&1; then
+    echo "配置文件损坏：$API_PROFILES_PATH"
+    return 1
+  fi
+}
+
+profiles_list() {
+  jq -r '.profiles | keys[]?' "$API_PROFILES_PATH" 2>/dev/null
+}
+
+profiles_get() {
+  local name="$1"
+  jq -e --arg n "$name" '.profiles[$n] // empty' "$API_PROFILES_PATH" >/dev/null 2>&1
+}
+
+profiles_set() {
+  local name="$1"
+  local api_url="$2"
+  local token="$3"
+  local model="$4"
+  jq --arg n "$name" --arg api "$api_url" --arg tok "$token" --arg mod "$model" \
+    '.profiles[$n] = {api_url:$api, token:$tok, model:$mod}' \
+    "$API_PROFILES_PATH" > "$API_PROFILES_PATH.tmp" && mv "$API_PROFILES_PATH.tmp" "$API_PROFILES_PATH"
+}
+
+profiles_delete() {
+  local name="$1"
+  jq --arg n "$name" 'del(.profiles[$n])' "$API_PROFILES_PATH" > "$API_PROFILES_PATH.tmp" \
+    && mv "$API_PROFILES_PATH.tmp" "$API_PROFILES_PATH"
+}
+
+extract_model_ids() {
+  local file="$1"
+  jq -r '
+    def normalize:
+      if type == "string" then .
+      elif type == "object" then (.id // .name // .model // empty)
+      else empty end;
+    if has("data") then (.data[]? | normalize)
+    elif has("models") then (.models[]? | normalize)
+    elif has("model_list") then (.model_list[]? | normalize)
+    else empty end
+  ' "$file" 2>/dev/null
+}
+
+clean_value() {
+  local value="$1"
+  printf '%s' "$value" | tr -d $'\"\' \r\n\t'
+}
+
+get_auth_mode() {
+  if [ -f "$AUTH_PATH" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.auth_mode // empty' "$AUTH_PATH" 2>/dev/null
+  fi
+}
+
+curl_openai_models() {
+  local endpoint="$1"
+  local token="$2"
+  local tmp="$3"
+  local clean_endpoint clean_token auth_mode header code
+  clean_endpoint="$(clean_value "$endpoint")"
+  clean_token="$(clean_value "$token")"
+  if [ -z "$clean_token" ]; then
+    code="$(command curl -q -sS -o "$tmp" -w "%{http_code}" "$clean_endpoint" || true)"
+    echo "$code"
+    return 0
+  fi
+  auth_mode="$(get_auth_mode)"
+  if [ "$auth_mode" = "apikey" ]; then
+    header="x-api-key: $clean_token"
+  else
+    header="Authorization: Bearer $clean_token"
+  fi
+  code="$(command curl -q -sS -X GET \
+    -H "$header" \
+    -o "$tmp" -w "%{http_code}" "$clean_endpoint" || true)"
+  echo "$code"
+}
+
+fetch_model_list() {
+  MODEL_FETCH_ERROR=""
+  local api_url token provider
+  local token_source="config"
+  api_url="${1:-}"
+  token="${2:-}"
+  provider="${3:-}"
+  if [ -n "${2:-}" ]; then
+    token_source="param"
+  fi
+  if [ -z "$api_url" ]; then
+    api_url="$(get_config_value "$API_URL_PATH")"
+  fi
+  if [ -z "$token" ]; then
+    token="$(get_config_value "$API_TOKEN_PATH")"
+  fi
+  if [ -n "$api_url" ]; then
+    api_url="$(clean_value "$api_url")"
+  fi
+  if [ -z "$provider" ]; then
+    provider="$(detect_provider "$api_url")"
+  fi
+  if [ -z "$token" ] && [ -f "$AUTH_PATH" ] && command -v jq >/dev/null 2>&1; then
+    if [ "$provider" = "anthropic" ]; then
+      token="$(jq -r '.ANTHROPIC_API_KEY // empty' "$AUTH_PATH" 2>/dev/null)"
+      token_source="auth:ANTHROPIC_API_KEY"
+    else
+      token="$(jq -r '.OPENAI_API_KEY // empty' "$AUTH_PATH" 2>/dev/null)"
+      token_source="auth:OPENAI_API_KEY"
+    fi
+  fi
+  if [ -n "$token" ]; then
+    token="$(clean_value "$token")"
+  fi
+  if [ -z "$token" ]; then
+    :
+    return 1
+  fi
+  if [ -z "$provider" ]; then
+    provider="$(detect_provider "$api_url")"
+  fi
+  if [ -z "$api_url" ]; then
+    MODEL_FETCH_ERROR="未设置 API 地址"
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    MODEL_FETCH_ERROR="未检测到 curl"
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    MODEL_FETCH_ERROR="未检测到 jq"
+    return 1
+  fi
+  local base endpoint tmp code
+  base="$(normalize_api_url "$api_url")"
+  if [ "$provider" = "openai" ]; then
+    if [ -z "$token" ]; then
+      MODEL_FETCH_ERROR="未读取到 Token"
+      return 1
+    fi
+    endpoint="${base}/models"
+    tmp="$(mktemp)"
+    code="$(curl_openai_models "$endpoint" "$token" "$tmp")"
+    if [ "$code" != "200" ]; then
+      if [ "$code" = "000" ]; then
+        MODEL_FETCH_ERROR="无法连接到 API"
+      else
+        MODEL_FETCH_ERROR="模型列表请求失败 (HTTP $code)"
+      fi
+      rm -f "$tmp"
+      return 1
+    fi
+    local models
+    models="$(extract_model_ids "$tmp")"
+    rm -f "$tmp"
+    if [ -z "$models" ]; then
+      MODEL_FETCH_ERROR="模型列表为空或接口返回格式不兼容"
+      return 1
+    fi
+    printf '%s\n' "$models"
+    return 0
+  fi
+  if [ "$provider" = "anthropic" ]; then
+    if [[ "$base" == */v1 ]]; then
+      endpoint="${base}/models"
+    else
+      endpoint="${base}/v1/models"
+    fi
+    tmp="$(mktemp)"
+    if [ -n "$token" ]; then
+      code="$(curl -sS -H "x-api-key: $token" -H "anthropic-version: 2023-06-01" -o "$tmp" -w "%{http_code}" "$endpoint" || true)"
+    else
+      code="$(curl -sS -H "anthropic-version: 2023-06-01" -o "$tmp" -w "%{http_code}" "$endpoint" || true)"
+    fi
+    if [ "$code" != "200" ]; then
+      if [ "$code" = "000" ]; then
+        MODEL_FETCH_ERROR="无法连接到 API"
+      else
+        MODEL_FETCH_ERROR="模型列表请求失败 (HTTP $code)"
+      fi
+      rm -f "$tmp"
+      return 1
+    fi
+    local models
+    models="$(extract_model_ids "$tmp")"
+    rm -f "$tmp"
+    if [ -z "$models" ]; then
+      MODEL_FETCH_ERROR="模型列表为空或接口返回格式不兼容"
+      return 1
+    fi
+    printf '%s\n' "$models"
+    return 0
+  fi
+  # 兼容 OpenAI 风格的自定义服务
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    local provider_name requires_auth requires_auth_raw
+    provider_name="$(get_toml_value "$TOML_PROVIDER_PATH")"
+    if [ -n "$provider_name" ]; then
+      requires_auth_raw="$(get_toml_value ".model_providers.${provider_name}.requires_openai_auth")"
+      requires_auth="$(printf '%s' "$requires_auth_raw" | tr '[:upper:]' '[:lower:]')"
+    fi
+    endpoint="${base}/models"
+    if { [ "$requires_auth" = "true" ] || [ "$requires_auth" = "1" ]; } && [ -z "$token" ]; then
+      MODEL_FETCH_ERROR="该服务要求 Token"
+      return 1
+    fi
+    tmp="$(mktemp)"
+    if [ "$requires_auth" = "true" ] || [ "$requires_auth" = "1" ]; then
+      code="$(curl_openai_models "$endpoint" "$token" "$tmp")"
+    else
+      code="$(curl -sS -o "$tmp" -w "%{http_code}" "$endpoint" || true)"
+    fi
+    if [ "$code" != "200" ]; then
+      if [ "$code" = "000" ]; then
+        MODEL_FETCH_ERROR="无法连接到 API"
+      else
+        MODEL_FETCH_ERROR="模型列表请求失败 (HTTP $code)"
+      fi
+      rm -f "$tmp"
+      return 1
+    fi
+    local models
+    models="$(extract_model_ids "$tmp")"
+    rm -f "$tmp"
+    if [ -z "$models" ]; then
+      MODEL_FETCH_ERROR="模型列表为空或接口返回格式不兼容"
+      return 1
+    fi
+    printf '%s\n' "$models"
+    return 0
+  fi
+  endpoint="${base}/models"
+  tmp="$(mktemp)"
+  code="$(curl_openai_models "$endpoint" "$token" "$tmp")"
+  if [ "$code" != "200" ]; then
+    if [ "$code" = "000" ]; then
+      MODEL_FETCH_ERROR="无法连接到 API"
+    else
+      MODEL_FETCH_ERROR="模型列表请求失败 (HTTP $code)"
+    fi
+    rm -f "$tmp"
+    return 1
+  fi
+  local models
+  models="$(extract_model_ids "$tmp")"
+  rm -f "$tmp"
+  if [ -z "$models" ]; then
+    MODEL_FETCH_ERROR="模型列表为空或接口返回格式不兼容"
+    return 1
+  fi
+  printf '%s\n' "$models"
+  return 0
+}
+
+fetch_models_into() {
+  local dest="$1"
+  local api_url="$2"
+  local token="$3"
+  local tmp status
+  tmp="$(mktemp)"
+  if fetch_model_list "$api_url" "$token" > "$tmp"; then
+    status=0
+  else
+    status=$?
+  fi
+  mapfile -t "$dest" < "$tmp"
+  rm -f "$tmp"
+  return "$status"
+}
+
+select_from_list() {
+  local prompt="$1"
+  shift
+  local items=("$@")
+  if [ "${#items[@]}" -eq 0 ]; then
+    return 1
+  fi
+  local i=1
+  for item in "${items[@]}"; do
+    echo "${i}. ${item}" >&2
+    i=$((i + 1))
+  done
+  read -r -p "$prompt" idx
+  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#items[@]}" ]; then
+    return 1
+  fi
+  echo "${items[$((idx - 1))]}"
+}
+
+select_model_or_name() {
+  local prompt="$1"
+  shift
+  local items=("$@")
+  local i=1
+  for item in "${items[@]}"; do
+    echo "${i}. ${item}" >&2
+    i=$((i + 1))
+  done
+  local input
+  read -r -p "$prompt" input
+  if [[ "$input" =~ ^[0-9]+$ ]]; then
+    if [ "$input" -ge 1 ] && [ "$input" -le "${#items[@]}" ]; then
+      echo "${items[$((input - 1))]}"
+      return 0
+    fi
+    return 1
+  fi
+  echo "$input"
+}
+
+filter_codex_models() {
+  local models=("$@")
+  local gpt_codex=()
+  local codex=()
+  local m
+  for m in "${models[@]}"; do
+    if [[ "$m" == *codex* ]] || [[ "$m" == *Codex* ]]; then
+      codex+=( "$m" )
+      if [[ "$m" == *gpt* ]] || [[ "$m" == *GPT* ]]; then
+        gpt_codex+=( "$m" )
+      fi
+    fi
+  done
+  if [ "${#gpt_codex[@]}" -gt 0 ]; then
+    printf '%s\n' "${gpt_codex[@]}"
+  elif [ "${#codex[@]}" -gt 0 ]; then
+    printf '%s\n' "${codex[@]}"
+  else
+    printf '%s\n' "${models[@]}"
+  fi
+}
+
+maybe_migrate_prompt() {
+  sync_codex_dirs
+  ensure_dir "$PROMPTS_DIR" "Prompts" || return 1
+  if [ -n "$(ls -A "$PROMPTS_DIR" 2>/dev/null)" ]; then
+    return 0
+  fi
+  local content
+  content="$(get_config_value "$PROMPT_PATH")"
+  if [ -z "$content" ]; then
+    return 0
+  fi
+  read -r -p "检测到配置里有 prompt，是否导出到 ${PROMPTS_DIR}/imported.md？[y/N] " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    printf "%s\n" "$content" > "${PROMPTS_DIR}/imported.md"
+    echo "已导出：${PROMPTS_DIR}/imported.md"
+  fi
+}
+
+maybe_migrate_mcp() {
+  return 0
+}
+
+maybe_migrate_skill() {
+  sync_codex_dirs
+  ensure_dir "$SKILLS_DIR" "Skills" || return 1
+  if [ -n "$(ls -A "$SKILLS_DIR" 2>/dev/null)" ]; then
+    return 0
+  fi
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! jq -e "$SKILL_PATH != null and ($SKILL_PATH|type==\"array\" or $SKILL_PATH|type==\"object\")" "$CONFIG_PATH" >/dev/null 2>&1; then
+    return 0
+  fi
+  read -r -p "检测到配置中有 Skill 数据，是否导出到 ${SKILLS_DIR}？[y/N] " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    python3 - "$CONFIG_PATH" "$SKILLS_DIR" "$SKILL_PATH" <<'PY'
+import sys, json, os
+cfg_path, out_dir, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+cur = data
+for p in path.lstrip('.').split('.'):
+    if not p:
+        continue
+    cur = cur.get(p)
+    if cur is None:
+        sys.exit(0)
+def write_item(name, obj):
+    dir_path = os.path.join(out_dir, name)
+    os.makedirs(dir_path, exist_ok=True)
+    file_path = os.path.join(dir_path, 'SKILL.md')
+    with open(file_path, 'w', encoding='utf-8') as f:
+        if isinstance(obj, str):
+            f.write(obj + \"\\n\")
+        else:
+            f.write(json.dumps(obj, ensure_ascii=False, indent=2) + \"\\n\")
+if isinstance(cur, list):
+    for i, item in enumerate(cur, 1):
+        name = item.get('name') if isinstance(item, dict) else f\"skill-{i}\"
+        write_item(name, item)
+elif isinstance(cur, dict):
+    for k, v in cur.items():
+        write_item(k, v)
+PY
+    echo "已导出 Skill 到目录：$SKILLS_DIR"
+  fi
+}
+
+maybe_migrate_on_start() {
+  if [ "$AUTO_MIGRATE" != "1" ] || [ "$MIGRATE_DONE" = "1" ]; then
+    return 0
+  fi
+  MIGRATE_DONE=1
+  ensure_config || return 0
+  maybe_migrate_prompt
+  maybe_migrate_mcp
+  maybe_migrate_skill
+}
+
+normalize_api_url() {
+  local url="$1"
+  url="${url%/}"
+  echo "$url"
+}
+
+detect_provider() {
+  local url="$1"
+  local lower
+  lower="$(echo "$url" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lower" == *"openai"* ]]; then
+    echo "openai"
+  elif [[ "$lower" == *"anthropic"* ]]; then
+    echo "anthropic"
+  else
+    echo "unknown"
+  fi
+}
+
+validate_connectivity() {
+  local url="$1"
+  if [ -z "$url" ]; then
+    echo "未设置 API 地址，无法校验。"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "未检测到 curl，跳过连通性校验。"
+    return 0
+  fi
+  local code
+  code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$CONNECT_TIMEOUT" "$url" || true)"
+  if [ "$code" = "000" ]; then
+    echo "连通性校验失败：无法连接到 $url"
+    return 1
+  fi
+  echo "连通性校验通过（HTTP $code）。"
+  return 0
+}
+
+validate_openai_model() {
+  local api_url="$1"
+  local token="$2"
+  local model="$3"
+  if [ -z "$token" ]; then
+    echo "未设置 Token，跳过模型可用性校验。"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "未检测到 curl，跳过模型可用性校验。"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "未检测到 jq，跳过模型可用性校验。"
+    return 0
+  fi
+
+  local base endpoint tmp code
+  base="$(normalize_api_url "$api_url")"
+  endpoint="${base}/models"
+  tmp="$(mktemp)"
+  code="$(curl -sS -H "Authorization: Bearer $token" -o "$tmp" -w "%{http_code}" \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$CONNECT_TIMEOUT" "$endpoint" || true)"
+  if [ "$code" = "000" ]; then
+    echo "模型校验失败：无法连接到 $endpoint"
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ "$code" -ge 400 ]; then
+    echo "模型校验失败（HTTP $code），可能是 Token 无效或接口受限。"
+    rm -f "$tmp"
+    return 1
+  fi
+  if jq -e --arg m "$model" '.data[]?.id == $m' "$tmp" >/dev/null 2>&1; then
+    echo "模型校验通过：$model"
+  else
+    echo "模型未在可用列表中找到：$model"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+validate_anthropic_model() {
+  local api_url="$1"
+  local token="$2"
+  local model="$3"
+  if [ -z "$token" ]; then
+    echo "未设置 Token，跳过模型可用性校验。"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "未检测到 curl，跳过模型可用性校验。"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "未检测到 jq，跳过模型可用性校验。"
+    return 0
+  fi
+
+  local base endpoint tmp code
+  base="$(normalize_api_url "$api_url")"
+  if [[ "$base" == */v1 ]]; then
+    endpoint="${base}/models"
+  else
+    endpoint="${base}/v1/models"
+  fi
+  tmp="$(mktemp)"
+  code="$(curl -sS -H "x-api-key: $token" -H "anthropic-version: 2023-06-01" \
+    -o "$tmp" -w "%{http_code}" --connect-timeout "$CONNECT_TIMEOUT" \
+    --max-time "$CONNECT_TIMEOUT" "$endpoint" || true)"
+  if [ "$code" = "000" ]; then
+    echo "模型校验失败：无法连接到 $endpoint"
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ "$code" -ge 400 ]; then
+    echo "模型校验失败（HTTP $code），接口可能不支持或 Token 无效。"
+    rm -f "$tmp"
+    return 1
+  fi
+  if jq -e --arg m "$model" '.data[]?.id == $m' "$tmp" >/dev/null 2>&1; then
+    echo "模型校验通过：$model"
+  else
+    echo "模型未在可用列表中找到：$model"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+validate_api_model() {
+  if [ "$ENABLE_VALIDATE" != "1" ]; then
+    return 0
+  fi
+  ensure_config || return 0
+  if [ "$CONFIG_FORMAT" = "json" ]; then
+    require_jq || return 0
+  fi
+  sync_paths
+
+  local api_url model token provider
+  api_url="$(get_config_value "$API_URL_PATH")"
+  model="$(get_config_value "$MODEL_PATH")"
+  token="$(get_config_value "$API_TOKEN_PATH")"
+  if [ -z "$token" ] && [ -f "$AUTH_PATH" ] && command -v jq >/dev/null 2>&1; then
+    local auth_key
+    provider="$(detect_provider "$api_url")"
+    if [ "$provider" = "anthropic" ]; then
+      auth_key="ANTHROPIC_API_KEY"
+    else
+      auth_key="OPENAI_API_KEY"
+    fi
+    token="$(jq -r --arg k "$auth_key" '.[$k] // empty' "$AUTH_PATH" 2>/dev/null)"
+  fi
+  provider="$(detect_provider "$api_url")"
+
+  echo "开始校验 API 连通性与模型可用性..."
+  validate_connectivity "$api_url" || return 1
+
+  if [ "$MODEL_CHECK" != "1" ]; then
+    echo "模型校验已关闭。"
+    return 0
+  fi
+
+  case "$provider" in
+    openai) validate_openai_model "$api_url" "$token" "$model" ;;
+    anthropic) validate_anthropic_model "$api_url" "$token" "$model" ;;
+    *)
+      echo "未识别服务商，仅做连通性校验。"
+      ;;
+  esac
+}
+
+json_type() {
+  local path="$1"
+  jq -r "($path | type) // \"null\"" "$CONFIG_PATH" 2>/dev/null
+}
+
+resolve_path() {
+  local var_name="$1"
+  local current_path="$2"
+  shift 2
+  local candidates=("$@")
+  if config_exists "$current_path"; then
+    return 0
+  fi
+
+  local cand
+  for cand in "${candidates[@]}"; do
+    if config_exists "$cand"; then
+      printf -v "$var_name" '%s' "$cand"
+      AUTO_PATH_NOTES+=( "$current_path -> $cand" )
+      return 0
+    fi
+  done
+}
+
+sync_paths() {
+  AUTO_PATH_NOTES=()
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    local provider
+    provider="$(get_toml_value "$TOML_PROVIDER_PATH")"
+    MODEL_PATH="$TOML_MODEL_PATH"
+    PROMPT_PATH="$TOML_PROMPT_PATH"
+    if [ -n "$provider" ]; then
+      API_URL_PATH=".model_providers.${provider}.base_url"
+    fi
+  else
+    resolve_path API_URL_PATH "$API_URL_PATH" "${API_URL_CANDIDATES[@]}"
+    resolve_path API_TOKEN_PATH "$API_TOKEN_PATH" "${API_TOKEN_CANDIDATES[@]}"
+    resolve_path MODEL_PATH "$MODEL_PATH" "${MODEL_CANDIDATES[@]}"
+    resolve_path PROMPT_PATH "$PROMPT_PATH" "${PROMPT_CANDIDATES[@]}"
+    resolve_path MCP_PATH "$MCP_PATH" "${MCP_CANDIDATES[@]}"
+    resolve_path SKILL_PATH "$SKILL_PATH" "${SKILL_CANDIDATES[@]}"
+  fi
+}
+
+count_json_path() {
+  local path="$1"
+  jq -r "def count(v):
+    if v == null then 0
+    elif (v|type) == \"array\" then (v|length)
+    elif (v|type) == \"object\" then (v|keys|length)
+    else 1 end;
+    count($path)
+  " "$CONFIG_PATH" 2>/dev/null
+}
+
+count_config_path() {
+  local path="$1"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    local value
+    value="$(get_toml_value "$path")"
+    if [ -z "$value" ]; then
+      echo "0"
+    else
+      if python3 - <<'PY' "$value" >/dev/null 2>&1
+import sys, json
+v = json.loads(sys.argv[1])
+if isinstance(v, list):
+    print(len(v))
+elif isinstance(v, dict):
+    print(len(v.keys()))
+else:
+    print(1)
+PY
+      then
+        python3 - <<'PY' "$value"
+import sys, json
+v = json.loads(sys.argv[1])
+if isinstance(v, list):
+    print(len(v))
+elif isinstance(v, dict):
+    print(len(v.keys()))
+else:
+    print(1)
+PY
+      else
+        echo "1"
+      fi
+    fi
+  else
+    count_json_path "$path"
+  fi
+}
+
+get_status() {
+  if [ -n "$SERVICE_NAME" ] && pgrep -f "$SERVICE_NAME" >/dev/null 2>&1; then
+    if [ -n "$C_GREEN" ]; then
+      printf "%s[运行中]%s\n" "$C_GREEN" "$C_RESET"
+    else
+      echo "[运行中]"
+    fi
+  else
+    if [ -n "$C_YELLOW" ]; then
+      printf "%s[未启动]%s\n" "$C_YELLOW" "$C_RESET"
+    else
+      echo "[未启动]"
+    fi
+  fi
+}
+
+get_version() {
+  if [ -n "$CODEX_BIN" ] && command -v "$CODEX_BIN" >/dev/null 2>&1; then
+    "$CODEX_BIN" --version 2>/dev/null | head -n 1
+  else
+    echo ""
+  fi
+}
+
+dashboard() {
+  local api_url model mcp_count skill_count
+
+  init_ui
+  clear
+  auto_detect_config_path
+  sync_codex_dirs
+  maybe_migrate_on_start
+  if [ -f "$CONFIG_PATH" ]; then
+    detect_config_format
+    sync_paths
+    api_url="$(get_config_value "$API_URL_PATH")"
+    model="$(get_config_value "$MODEL_PATH")"
+    if [ "$CONFIG_FORMAT" = "toml" ]; then
+      mcp_count="$(toml_mcp_count)"
+      skill_count="$(find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      mcp_count="$(count_config_path "$MCP_PATH")"
+      skill_count="$(count_config_path "$SKILL_PATH")"
+    fi
+  else
+    api_url=""
+    model=""
+    mcp_count="0"
+    skill_count="0"
+  fi
+
+  ui_logo
+  local line_status line_version line_path line_api line_model line_mount line_cmd
+  local label_status label_version label_path label_api label_model label_mount
+  label_status="$(color_wrap "$C_CYAN" "状态")"
+  label_version="$(color_wrap "$C_CYAN" "版本")"
+  label_path="$(color_wrap "$C_CYAN" "配置")"
+  label_api="$(color_wrap "$C_CYAN" "API")"
+  label_model="$(color_wrap "$C_CYAN" "模型")"
+  label_mount="$(color_wrap "$C_CYAN" "挂载")"
+  line_status="${label_status} : $(get_status)"
+  line_version="${label_version} : $(get_version)"
+  line_path="${label_path} : $CONFIG_PATH"
+  line_api="${label_api}  : $api_url"
+  line_model="${label_model} : $model"
+  line_mount="${label_mount} : MCP $mcp_count | Skill $skill_count"
+  line_cmd="$(color_wrap "$C_CYAN" "命令") : cx"
+  ui_status_box "$line_status" "$line_version" "$line_path" "$line_api" "$line_model" "$line_mount" "$line_cmd"
+  if [ "${#AUTO_PATH_NOTES[@]}" -gt 0 ]; then
+    echo "路径适配: 已检测到非默认字段：${AUTO_PATH_NOTES[*]}（仅本次运行生效）"
+  fi
+  echo
+}
+
+api_menu() {
+  while true; do
+    echo
+    local choice
+    choice="$(menu_choose "API 和模型管理" \
+      "新增 API 地址与 Token" \
+      "修改当前模型" \
+      "快速切换预设配置 (OpenAI / Anthropic)" \
+      "配置管理 (新增/切换/修改/删除)" \
+      "返回主菜单")"
+    if [ -z "$choice" ]; then
+      return
+    fi
+    case "$choice" in
+      1)
+        profiles_init || { pause; continue; }
+        local profile_name new_api new_token
+        read -r -p "请输入配置名称（留空取消）: " profile_name
+        if [ -z "$profile_name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        read -r -p "请输入 API 地址（留空取消）: " new_api
+        read -r -p "请输入 Token（留空取消）: " new_token
+        if [ -z "$new_api" ] || [ -z "$new_token" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        if profiles_get "$profile_name" >/dev/null 2>&1; then
+          read -r -p "配置已存在，是否覆盖？[y/N] " ans
+          if ! [[ "$ans" =~ ^[Yy]$ ]]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+        fi
+        profiles_set "$profile_name" "$new_api" "$new_token" "" && echo "已新增配置：$profile_name"
+        read -r -p "是否立即应用该配置？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          ensure_config || { pause; continue; }
+          if [ "$CONFIG_FORMAT" = "json" ]; then
+            require_jq || { pause; continue; }
+          fi
+          sync_paths
+          backup_config
+          if set_config_value "$API_URL_PATH" "$new_api" && set_token_value "$new_token"; then
+            local models model_choice
+            fetch_models_into models "$new_api" "$new_token"
+            if [ "${#models[@]}" -gt 0 ]; then
+              mapfile -t models < <(filter_codex_models "${models[@]}")
+            fi
+            if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+              echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+            fi
+            if [ "${#models[@]}" -gt 0 ]; then
+              echo "可用模型列表："
+              model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+              if [ -n "$model_choice" ]; then
+                if set_config_value "$MODEL_PATH" "$model_choice"; then
+                  profiles_set "$profile_name" "$new_api" "$new_token" "$model_choice"
+                  echo "已应用配置并更新模型：$model_choice"
+                else
+                  echo "修改模型失败，已取消。"
+                  restore_backup
+                fi
+              else
+                echo "模型保持不变。"
+              fi
+            else
+              echo "未能获取模型列表，跳过模型设置。"
+            fi
+            validate_or_rollback
+          else
+            echo "应用配置失败，已取消。"
+            restore_backup
+          fi
+        fi
+        pause
+        ;;
+      2)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "json" ]; then
+          require_jq || { pause; continue; }
+        fi
+        sync_paths
+        backup_config
+        local models model_choice current_model
+        current_model="$(get_config_value "$MODEL_PATH")"
+        echo "当前模型：${current_model:-<空>}"
+        fetch_models_into models "" ""
+        if [ "${#models[@]}" -gt 0 ]; then
+          mapfile -t models < <(filter_codex_models "${models[@]}")
+        fi
+        if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+          echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+        fi
+        if [ "${#models[@]}" -gt 0 ]; then
+          echo "可用模型列表："
+          model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+          if [ -n "$model_choice" ]; then
+            if set_config_value "$MODEL_PATH" "$model_choice"; then
+              echo "已更新模型。"
+            else
+              echo "修改模型失败，已取消。"
+              restore_backup
+              pause
+              continue
+            fi
+          else
+            echo "模型保持不变。"
+            pause
+            continue
+          fi
+        else
+          read -r -p "请输入新的模型名称（留空不变）: " new_model
+          if [ -n "$new_model" ]; then
+            if set_config_value "$MODEL_PATH" "$new_model"; then
+              echo "已更新模型。"
+            else
+              echo "修改模型失败，已取消。"
+              restore_backup
+              pause
+              continue
+            fi
+          else
+            echo "模型保持不变。"
+            pause
+            continue
+          fi
+        fi
+        validate_or_rollback
+        pause
+        ;;
+      3)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "json" ]; then
+          require_jq || { pause; continue; }
+        fi
+        backup_config
+        local changed=0
+        echo "1. OpenAI 预设"
+        echo "2. Anthropic 预设"
+        read -r -p "请选择（留空取消）: " preset
+        if [ -z "$preset" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        case "$preset" in
+          1)
+            if set_config_value "$API_URL_PATH" "$OPENAI_API_URL" && set_config_value "$MODEL_PATH" "$OPENAI_MODEL"; then
+              changed=1
+            else
+              echo "预设切换失败，已取消。"
+              restore_backup
+              pause
+              continue
+            fi
+            echo "已切换到 OpenAI 预设。"
+            ;;
+          2)
+            if set_config_value "$API_URL_PATH" "$ANTHROPIC_API_URL" && set_config_value "$MODEL_PATH" "$ANTHROPIC_MODEL"; then
+              changed=1
+            else
+              echo "预设切换失败，已取消。"
+              restore_backup
+              pause
+              continue
+            fi
+            echo "已切换到 Anthropic 预设。"
+            ;;
+          *)
+            echo "无效选择。"
+            ;;
+        esac
+        read -r -p "是否更新 Token？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          read -r -p "请输入新的 Token（留空不变）: " new_token
+          if [ -n "$new_token" ]; then
+            if set_token_value "$new_token"; then
+              changed=1
+              echo "已更新 Token。"
+            else
+              echo "修改 Token 失败，已取消。"
+              restore_backup
+              pause
+              continue
+            fi
+          else
+            echo "Token 为空，保持不变。"
+          fi
+        fi
+        if [ "$changed" -eq 1 ]; then
+          validate_or_rollback
+        else
+          echo "没有任何变更，跳过校验。"
+        fi
+        pause
+        ;;
+      4)
+        profiles_init || { pause; continue; }
+        while true; do
+          echo
+          local pc
+          pc="$(menu_choose "配置管理" \
+            "列出配置" \
+            "切换配置" \
+            "修改配置" \
+            "删除配置" \
+            "返回")"
+          if [ -z "$pc" ]; then
+            break
+          fi
+          case "$pc" in
+            1)
+              echo "已保存的配置："
+              mapfile -t names < <(profiles_list)
+              if [ "${#names[@]}" -eq 0 ]; then
+                echo "暂无配置。"
+              else
+                local n
+                for n in "${names[@]}"; do
+                  local api model
+                  api="$(jq -r --arg n "$n" '.profiles[$n].api_url // ""' "$API_PROFILES_PATH")"
+                  model="$(jq -r --arg n "$n" '.profiles[$n].model // ""' "$API_PROFILES_PATH")"
+                  echo "- $n: ${api} | ${model}"
+                done
+              fi
+              pause
+              ;;
+            2)
+              mapfile -t names < <(profiles_list)
+              if [ "${#names[@]}" -eq 0 ]; then
+                echo "暂无配置。"
+                pause
+                continue
+              fi
+              echo "请选择要切换的配置："
+              local i=1 sel
+              for sel in "${names[@]}"; do
+                echo "${i}. ${sel}"
+                i=$((i + 1))
+              done
+              read -r -p "输入序号（留空取消）: " idx
+              if [ -z "$idx" ]; then
+                echo "已取消。"
+                pause
+                continue
+              fi
+              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+                echo "无效序号。"
+                pause
+                continue
+              fi
+              local name api_url token model
+              name="${names[$((idx - 1))]}"
+              api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
+              token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
+              model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
+              backup_config
+              if [ -n "$api_url" ]; then
+                set_config_value "$API_URL_PATH" "$api_url" || { echo "切换失败。"; restore_backup; pause; continue; }
+              fi
+              if [ -n "$token" ]; then
+                set_token_value "$token" || { echo "切换失败。"; restore_backup; pause; continue; }
+              fi
+              if [ -n "$model" ]; then
+                set_config_value "$MODEL_PATH" "$model" || { echo "切换失败。"; restore_backup; pause; continue; }
+              fi
+              local models model_choice
+              fetch_models_into models "$api_url" "$token"
+              if [ "${#models[@]}" -gt 0 ]; then
+                mapfile -t models < <(filter_codex_models "${models[@]}")
+              fi
+              if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+                echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+              fi
+              if [ "${#models[@]}" -gt 0 ]; then
+                echo "可用模型列表："
+                model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+                if [ -n "$model_choice" ]; then
+                  if set_config_value "$MODEL_PATH" "$model_choice"; then
+                    profiles_set "$name" "$api_url" "$token" "$model_choice"
+                    model="$model_choice"
+                  else
+                    echo "修改模型失败，已取消。"
+                    restore_backup
+                    pause
+                    continue
+                  fi
+                fi
+              fi
+              echo "已切换到配置：$name"
+              validate_or_rollback
+              pause
+              ;;
+            3)
+              mapfile -t names < <(profiles_list)
+              if [ "${#names[@]}" -eq 0 ]; then
+                echo "暂无配置。"
+                pause
+                continue
+              fi
+              echo "请选择要修改的配置："
+              local i=1 sel
+              for sel in "${names[@]}"; do
+                echo "${i}. ${sel}"
+                i=$((i + 1))
+              done
+              read -r -p "输入序号（留空取消）: " idx
+              if [ -z "$idx" ]; then
+                echo "已取消。"
+                pause
+                continue
+              fi
+              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+                echo "无效序号。"
+                pause
+                continue
+              fi
+              local name api_url token model
+              name="${names[$((idx - 1))]}"
+              api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
+              token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
+              model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
+              read -r -p "API 地址（留空不变，当前: ${api_url:-<空>}）: " new_api
+              read -r -p "Token（留空不变）: " new_token
+              [ -n "$new_api" ] && api_url="$new_api"
+              [ -n "$new_token" ] && token="$new_token"
+              local models model_choice
+              fetch_models_into models "$api_url" "$token"
+              if [ "${#models[@]}" -gt 0 ]; then
+                mapfile -t models < <(filter_codex_models "${models[@]}")
+              fi
+              if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+                echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+              fi
+              if [ "${#models[@]}" -gt 0 ]; then
+                echo "可用模型列表："
+                model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+                if [ -n "$model_choice" ]; then
+                  model="$model_choice"
+                fi
+              else
+                read -r -p "模型（留空不变，当前: ${model:-<空>}）: " new_model
+                [ -n "$new_model" ] && model="$new_model"
+              fi
+              profiles_set "$name" "$api_url" "$token" "$model" && echo "已更新配置：$name"
+              pause
+              ;;
+            4)
+              mapfile -t names < <(profiles_list)
+              if [ "${#names[@]}" -eq 0 ]; then
+                echo "暂无配置。"
+                pause
+                continue
+              fi
+              echo "请选择要删除的配置："
+              local i=1 sel
+              for sel in "${names[@]}"; do
+                echo "${i}. ${sel}"
+                i=$((i + 1))
+              done
+              read -r -p "输入序号（留空取消）: " idx
+              if [ -z "$idx" ]; then
+                echo "已取消。"
+                pause
+                continue
+              fi
+              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+                echo "无效序号。"
+                pause
+                continue
+              fi
+              local name
+              name="${names[$((idx - 1))]}"
+              read -r -p "确认删除配置 $name ? [y/N] " ans
+              if [[ "$ans" =~ ^[Yy]$ ]]; then
+                profiles_delete "$name" && echo "已删除：$name"
+              else
+                echo "已取消。"
+              fi
+              pause
+              ;;
+            0) break ;;
+            *) echo "无效选择。" ;;
+          esac
+        done
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。"
+        ;;
+    esac
+  done
+}
+
+prompt_menu() {
+  while true; do
+    echo
+    local choice
+    choice="$(menu_choose "提示词 (Prompt) 管理" \
+      "列出提示词文件" \
+      "查看提示词内容" \
+      "新建提示词 (Markdown)" \
+      "删除提示词文件" \
+      "禁用提示词" \
+      "启用提示词" \
+      "禁用全部提示词" \
+      "启用全部提示词" \
+      "Vim 深度编辑" \
+      "返回主菜单")"
+    if [ -z "$choice" ]; then
+      return
+    fi
+    case "$choice" in
+      1)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        echo "提示词文件列表:"
+        echo "启用:"
+        local has_enabled=0
+        for f in "$PROMPTS_DIR"/*.md; do
+          if [ -f "$f" ] && [[ "$f" != *.md.disabled ]]; then
+            echo "- $(basename "$f")"
+            has_enabled=1
+          fi
+        done
+        if [ "$has_enabled" -eq 0 ]; then
+          echo "- 无"
+        fi
+        echo "禁用:"
+        local has_disabled=0
+        for f in "$PROMPTS_DIR"/*.md.disabled; do
+          if [ -f "$f" ]; then
+            echo "- $(basename "$f")"
+            has_disabled=1
+          fi
+        done
+        if [ "$has_disabled" -eq 0 ]; then
+          echo "- 无"
+        fi
+        pause
+        ;;
+      2)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        read -r -p "请输入提示词文件名（不含 .md 也可以，留空取消）: " name
+        if [ -z "$name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        local file
+        file="$(prompt_path_from_name "$name")"
+        if [ ! -f "$file" ]; then
+          echo "文件不存在：$file"
+          pause
+          continue
+        fi
+        echo "提示词内容:"
+        cat "$file"
+        pause
+        ;;
+      3)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        read -r -p "请输入新提示词名称（将保存为 .md，留空取消）: " name
+        if [ -z "$name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        local file
+        file="$(prompt_path_from_name "$name")"
+        if [ -f "$file" ]; then
+          echo "已存在：$file"
+        else
+          printf "" > "$file" || { echo "创建失败：$file"; pause; continue; }
+          echo "已创建：$file"
+        fi
+        read -r -p "是否立即编辑？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          vim "$file"
+        fi
+        pause
+        ;;
+      4)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        read -r -p "请输入要删除的提示词文件名（不含 .md 也可以，留空取消）: " name
+        if [ -z "$name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        local file
+        file="$(prompt_path_from_name "$name")"
+        if [ ! -f "$file" ]; then
+          echo "未找到：$file"
+          pause
+          continue
+        fi
+        read -r -p "确认删除 $file ? [y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          trash_move "$file" "prompt"
+        else
+          echo "已取消。"
+        fi
+        pause
+        ;;
+      5)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        mapfile -t files < <(ls -1 "$PROMPTS_DIR"/*.md 2>/dev/null | grep -v '\\.md\\.disabled$' | sed 's#.*/##')
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "暂无可禁用的提示词。"
+          pause
+        else
+          echo "请选择要禁用的提示词："
+          local i=1 f
+          for f in "${files[@]}"; do
+            echo "${i}. ${f}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+          else
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#files[@]}" ]; then
+              echo "无效序号。"
+            else
+              local src dst
+              src="$PROMPTS_DIR/${files[$((idx - 1))]}"
+              dst="${src}.disabled"
+              if [ -e "$dst" ]; then
+                echo "已存在禁用文件：$dst"
+              else
+                mv "$src" "$dst" && echo "已禁用：$(basename "$src")"
+              fi
+            fi
+          fi
+        fi
+        ;;
+      6)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        mapfile -t files < <(ls -1 "$PROMPTS_DIR"/*.md.disabled 2>/dev/null | sed 's#.*/##')
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "暂无可启用的提示词。"
+          pause
+        else
+          echo "请选择要启用的提示词："
+          local i=1 f
+          for f in "${files[@]}"; do
+            echo "${i}. ${f}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+          else
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#files[@]}" ]; then
+              echo "无效序号。"
+            else
+              local src dst
+              src="$PROMPTS_DIR/${files[$((idx - 1))]}"
+              dst="${src%.disabled}"
+              if [ -e "$dst" ]; then
+                echo "已存在启用文件：$dst"
+              else
+                mv "$src" "$dst" && echo "已启用：$(basename "$dst")"
+              fi
+            fi
+          fi
+        fi
+        ;;
+      7)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        read -r -p "确认禁用全部提示词？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          local moved=0
+          for f in "$PROMPTS_DIR"/*.md; do
+            if [ -f "$f" ] && [[ "$f" != *.md.disabled ]]; then
+              mv "$f" "$f.disabled" && moved=1
+            fi
+          done
+          if [ "$moved" -eq 1 ]; then
+            echo "已禁用全部提示词。"
+          else
+            echo "没有可禁用的提示词。"
+          fi
+        else
+          echo "已取消。"
+        fi
+        pause
+        ;;
+      8)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        read -r -p "确认启用全部提示词？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          local moved=0
+          for f in "$PROMPTS_DIR"/*.md.disabled; do
+            if [ -f "$f" ]; then
+              local dst="${f%.disabled}"
+              mv "$f" "$dst" && moved=1
+            fi
+          done
+          if [ "$moved" -eq 1 ]; then
+            echo "已启用全部提示词。"
+          else
+            echo "没有可启用的提示词。"
+          fi
+        else
+          echo "已取消。"
+        fi
+        pause
+        ;;
+      9)
+        sync_codex_dirs
+        ensure_dir "$PROMPTS_DIR" "Prompts" || { pause; continue; }
+        mapfile -t files < <(ls -1 "$PROMPTS_DIR"/*.md 2>/dev/null | grep -v '\\.md\\.disabled$' | sed 's#.*/##')
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "暂无提示词文件，已取消。"
+          pause
+        else
+          echo "可编辑的提示词文件："
+          local i=1 f
+          for f in "${files[@]}"; do
+            echo "${i}. ${f}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+          else
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#files[@]}" ]; then
+              echo "无效序号。"
+            else
+              vim "$PROMPTS_DIR/${files[$((idx - 1))]}"
+            fi
+          fi
+        fi
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。"
+        ;;
+    esac
+  done
+}
+
+ensure_collection_kind() {
+  local label="$1"
+  local path="$2"
+  if [ "$CONFIG_FORMAT" = "toml" ]; then
+    echo "$label TOML 模式下暂不支持新增/删除，请使用 Vim 编辑。"
+    return 1
+  fi
+  local kind
+  kind="$(json_type "$path")"
+  if [ "$kind" = "null" ]; then
+    echo "$label 配置不存在，需要先初始化类型。"
+    echo "1. 数组"
+    echo "2. 对象"
+    echo "0. 返回"
+    read -r -p "请选择（留空返回）: " init_choice
+    if [ -z "$init_choice" ]; then
+      return 1
+    fi
+    case "$init_choice" in
+      1)
+        backup_config
+        set_json_raw "$path" "[]"
+        echo "已初始化为空数组。"
+        ;;
+      2)
+        backup_config
+        set_json_raw "$path" "{}"
+        echo "已初始化为空对象。"
+        ;;
+      0)
+        return 1
+        ;;
+      *)
+        echo "无效选择。"
+        return 1
+        ;;
+    esac
+    kind="$(json_type "$path")"
+  fi
+  if [ "$kind" != "array" ] && [ "$kind" != "object" ]; then
+    echo "$label 当前类型为 $kind，无法执行新增/删除，请用 Vim 手动调整。"
+    return 1
+  fi
+  echo "$kind"
+}
+
+collection_add() {
+  local label="$1"
+  local path="$2"
+  local kind
+  kind="$(ensure_collection_kind "$label" "$path")" || return 1
+
+  if [ "$kind" = "array" ]; then
+    read -r -p "请输入要新增的条目（支持 JSON，普通文本将作为字符串，留空取消）： " item
+    if [ -z "$item" ]; then
+      echo "未输入，已取消。"
+      return 1
+    fi
+    local json_item
+    json_item="$(to_json_literal "$item")"
+    backup_config
+    local arr
+    arr="$(path_to_jq_array "$path")"
+    jq --argjson item "$json_item" --argjson p "$arr" \
+      'setpath($p; (getpath($p)//[]) + [$item])' \
+      "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    echo "已新增条目。"
+  else
+    read -r -p "请输入新增项的 key（留空取消）： " key
+    if [ -z "$key" ]; then
+      echo "未输入，已取消。"
+      return 1
+    fi
+    read -r -p "请输入新增项的 value（支持 JSON，普通文本将作为字符串，留空取消）： " value
+    if [ -z "$value" ]; then
+      echo "未输入，已取消。"
+      return 1
+    fi
+    local json_value
+    json_value="$(to_json_literal "$value")"
+    backup_config
+    local arr
+    arr="$(path_to_jq_array "$path")"
+    jq --arg k "$key" --argjson v "$json_value" --argjson p "$arr" \
+      'setpath($p; (getpath($p)//{}) | .[$k] = $v)' \
+      "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    echo "已新增条目。"
+  fi
+}
+
+collection_remove() {
+  local label="$1"
+  local path="$2"
+  local kind
+  kind="$(ensure_collection_kind "$label" "$path")" || return 1
+
+  if [ "$kind" = "array" ]; then
+    echo "当前条目列表（索引: 内容）："
+    jq -r "$path | to_entries[] | \"\\(.key): \\(.value|@json)\"" "$CONFIG_PATH" 2>/dev/null
+    read -r -p "请输入要删除的索引（留空取消）: " idx
+    if [ -z "$idx" ]; then
+      echo "未输入，已取消。"
+      return 1
+    fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+      echo "索引必须是数字。"
+      return 1
+    fi
+    backup_config
+    local arr
+    arr="$(path_to_jq_array "$path")"
+    jq --argjson i "$idx" --argjson p "$arr" \
+      'setpath($p; (getpath($p)//[]) | del(.[$i]))' \
+      "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    echo "已删除条目。"
+  else
+    echo "当前条目列表（key: value）："
+    jq -r "$path | to_entries[] | \"\\(.key): \\(.value|@json)\"" "$CONFIG_PATH" 2>/dev/null
+    read -r -p "请输入要删除的 key（留空取消）: " key
+    if [ -z "$key" ]; then
+      echo "未输入，已取消。"
+      return 1
+    fi
+    backup_config
+    local arr
+    arr="$(path_to_jq_array "$path")"
+    jq --arg k "$key" --argjson p "$arr" \
+      'setpath($p; (getpath($p)//{}) | del(.[$k]))' \
+      "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    echo "已删除条目。"
+  fi
+}
+
+mcp_menu() {
+  while true; do
+    echo
+    local choice
+    choice="$(menu_choose "MCP (上下文协议) 管理"       "列出 MCP"       "查看 MCP"       "新增 MCP"       "修改 MCP"       "删除 MCP"       "禁用 MCP"       "启用 MCP"       "禁用全部 MCP"       "启用全部 MCP"       "返回主菜单")"
+    if [ -z "$choice" ]; then
+      return
+    fi
+    case "$choice" in
+      1)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          echo "MCP 列表:"
+          mapfile -t names < <(toml_mcp_list_names)
+          mapfile -t disabled < <(toml_mcp_list_disabled_names)
+          if [ "${#names[@]}" -eq 0 ] && [ "${#disabled[@]}" -eq 0 ]; then
+            echo "暂无 MCP。"
+          else
+            if [ "${#names[@]}" -gt 0 ]; then
+              echo "启用:"
+              local n
+              for n in "${names[@]}"; do
+                echo "- $n"
+              done
+            fi
+            if [ "${#disabled[@]}" -gt 0 ]; then
+              echo "禁用:"
+              local d
+              for d in "${disabled[@]}"; do
+                echo "- $d"
+              done
+            fi
+          fi
+        else
+          require_jq || { pause; continue; }
+          local kind
+          kind="$(json_type "$MCP_PATH")"
+          echo "MCP 列表:"
+          if [ "$kind" = "object" ]; then
+            jq -r "$MCP_PATH | keys[]?" "$CONFIG_PATH"
+          elif [ "$kind" = "array" ]; then
+            jq -r "$MCP_PATH | to_entries[] | \"\\(.key): \\(.value.name // \\\"\\\")\"" "$CONFIG_PATH"
+          else
+            echo "暂无 MCP。"
+          fi
+        fi
+        pause
+        ;;
+      2)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          mapfile -t names < <(toml_mcp_list_names)
+          mapfile -t disabled < <(toml_mcp_list_disabled_names)
+          if [ "${#names[@]}" -eq 0 ] && [ "${#disabled[@]}" -eq 0 ]; then
+            echo "暂无 MCP。"
+            pause
+            continue
+          fi
+          echo "请选择要查看的 MCP："
+          local i=1 sel
+          local all_names=()
+          local all_status=()
+          for sel in "${names[@]}"; do
+            echo "${i}. [启用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "enabled" )
+            i=$((i + 1))
+          done
+          for sel in "${disabled[@]}"; do
+            echo "${i}. [禁用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "disabled" )
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#all_names[@]}" ]; then
+            echo "无效序号。"
+            pause
+            continue
+          fi
+          local name status
+          name="${all_names[$((idx - 1))]}"
+          status="${all_status[$((idx - 1))]}"
+          echo "MCP 配置内容:"
+          if [ "$status" = "disabled" ]; then
+            toml_mcp_get_block_disabled "$name"
+          else
+            toml_mcp_get_block "$name"
+          fi
+        else
+          require_jq || { pause; continue; }
+          local kind
+          kind="$(json_type "$MCP_PATH")"
+          if [ "$kind" = "object" ]; then
+            read -r -p "请输入 MCP 名称（key，留空取消）: " key
+            if [ -z "$key" ]; then
+              echo "已取消。"
+              pause
+              continue
+            fi
+            jq -r "$MCP_PATH[\"$key\"]" "$CONFIG_PATH"
+          elif [ "$kind" = "array" ]; then
+            read -r -p "请输入 MCP 索引（留空取消）: " idx
+            if [ -z "$idx" ]; then
+              echo "已取消。"
+              pause
+              continue
+            fi
+            jq -r "$MCP_PATH[$idx]" "$CONFIG_PATH"
+          else
+            echo "暂无 MCP。"
+          fi
+        fi
+        pause
+        ;;
+      3)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          echo "请粘贴完整 MCP TOML 段落（空行结束）："
+          local block=""
+          while true; do
+            IFS= read -r line
+            if [ -z "$line" ]; then
+              break
+            fi
+            block+="${line}"$'\n'
+          done
+          if [ -z "$block" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          local name
+          name="$(printf '%s' "$block" | sed -n 's/^\[mcp_servers\(_disabled\)\?\.\([^]]\+\)\].*/\2/p' | head -n1)"
+          if [ -z "$name" ]; then
+            echo "未检测到 [mcp_servers.<name>] 段落，已取消。"
+            pause
+            continue
+          fi
+          toml_mcp_add_raw_block "$name" "$block"
+          echo "已新增 MCP：$name"
+        else
+          collection_add "MCP" "$MCP_PATH"
+        fi
+        pause
+        ;;
+      4)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          mapfile -t names < <(toml_mcp_list_names)
+          mapfile -t disabled < <(toml_mcp_list_disabled_names)
+          if [ "${#names[@]}" -eq 0 ] && [ "${#disabled[@]}" -eq 0 ]; then
+            echo "暂无 MCP。"
+            pause
+            continue
+          fi
+          echo "请选择要修改的 MCP："
+          local i=1 sel
+          local all_names=()
+          local all_status=()
+          for sel in "${names[@]}"; do
+            echo "${i}. [启用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "enabled" )
+            i=$((i + 1))
+          done
+          for sel in "${disabled[@]}"; do
+            echo "${i}. [禁用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "disabled" )
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#all_names[@]}" ]; then
+            echo "无效序号。"
+            pause
+            continue
+          fi
+          local old_name new_name block status
+          old_name="${all_names[$((idx - 1))]}"
+          status="${all_status[$((idx - 1))]}"
+          echo "当前配置："
+          if [ "$status" = "disabled" ]; then
+            toml_mcp_get_block_disabled "$old_name"
+          else
+            toml_mcp_get_block "$old_name"
+          fi
+          echo "请粘贴新的 MCP TOML 段落（空行结束，留空取消）："
+          block=""
+          while true; do
+            IFS= read -r line
+            if [ -z "$line" ]; then
+              break
+            fi
+            block+="${line}"$'\n'
+          done
+          if [ -z "$block" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          new_name="$(printf '%s' "$block" | sed -n 's/^\[mcp_servers\(_disabled\)\?\.\([^]]\+\)\].*/\2/p' | head -n1)"
+          if [ -z "$new_name" ]; then
+            echo "未检测到 [mcp_servers.<name>] 段落，已取消。"
+            pause
+            continue
+          fi
+          toml_mcp_replace_block "$old_name" "$new_name" "$block"
+          echo "已更新 MCP：$new_name"
+        else
+          echo "JSON 配置暂不支持修改 MCP，请用 Vim 直接编辑。"
+        fi
+        pause
+        ;;
+      5)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          mapfile -t names < <(toml_mcp_list_names)
+          mapfile -t disabled < <(toml_mcp_list_disabled_names)
+          if [ "${#names[@]}" -eq 0 ] && [ "${#disabled[@]}" -eq 0 ]; then
+            echo "暂无 MCP。"
+            pause
+            continue
+          fi
+          echo "请选择要删除的 MCP："
+          local i=1 sel
+          local all_names=()
+          local all_status=()
+          for sel in "${names[@]}"; do
+            echo "${i}. [启用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "enabled" )
+            i=$((i + 1))
+          done
+          for sel in "${disabled[@]}"; do
+            echo "${i}. [禁用] ${sel}"
+            all_names+=( "$sel" )
+            all_status+=( "disabled" )
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#all_names[@]}" ]; then
+            echo "无效序号。"
+            pause
+            continue
+          fi
+          local name
+          name="${all_names[$((idx - 1))]}"
+          read -r -p "确认删除 $name ? [y/N] " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            backup_config
+            toml_mcp_remove_any_block "$name"
+            echo "已删除：$name"
+          else
+            echo "已取消。"
+          fi
+        else
+          collection_remove "MCP" "$MCP_PATH"
+        fi
+        pause
+        ;;
+      6)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          mapfile -t names < <(toml_mcp_list_names)
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "暂无可禁用的 MCP。"
+            pause
+            continue
+          fi
+          echo "请选择要禁用的 MCP："
+          local i=1 sel
+          for sel in "${names[@]}"; do
+            echo "${i}. ${sel}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+            echo "无效序号。"
+            pause
+            continue
+          fi
+          local name
+          name="${names[$((idx - 1))]}"
+          backup_config
+          toml_mcp_disable_name "$name"
+          echo "已禁用：$name"
+        else
+          echo "JSON 配置暂不支持禁用 MCP。"
+        fi
+        pause
+        ;;
+      7)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          mapfile -t names < <(toml_mcp_list_disabled_names)
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "暂无可启用的 MCP。"
+            pause
+            continue
+          fi
+          echo "请选择要启用的 MCP："
+          local i=1 sel
+          for sel in "${names[@]}"; do
+            echo "${i}. ${sel}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+            continue
+          fi
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+            echo "无效序号。"
+            pause
+            continue
+          fi
+          local name
+          name="${names[$((idx - 1))]}"
+          backup_config
+          toml_mcp_enable_name "$name"
+          echo "已启用：$name"
+        else
+          echo "JSON 配置暂不支持启用 MCP。"
+        fi
+        pause
+        ;;
+      8)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          read -r -p "确认禁用全部 MCP？[y/N] " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            backup_config
+            toml_mcp_disable_all
+            echo "已禁用全部 MCP。"
+          else
+            echo "已取消。"
+          fi
+        else
+          echo "JSON 配置暂不支持禁用 MCP。"
+        fi
+        pause
+        ;;
+      9)
+        ensure_config || { pause; continue; }
+        if [ "$CONFIG_FORMAT" = "toml" ]; then
+          read -r -p "确认启用全部 MCP？[y/N] " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            backup_config
+            toml_mcp_enable_all
+            echo "已启用全部 MCP。"
+          else
+            echo "已取消。"
+          fi
+        else
+          echo "JSON 配置暂不支持启用 MCP。"
+        fi
+        pause
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。"
+        ;;
+    esac
+  done
+}
+skill_menu() {
+  while true; do
+    echo
+    local choice
+    choice="$(menu_choose "Skill (技能/工具) 管理" \
+      "列出 Skill 目录" \
+      "查看 SKILL.md" \
+      "新建 Skill" \
+      "删除 Skill" \
+      "Vim 深度编辑" \
+      "返回主菜单")"
+    if [ -z "$choice" ]; then
+      return
+    fi
+    case "$choice" in
+      1)
+        sync_codex_dirs
+        ensure_dir "$SKILLS_DIR" "Skills" || { pause; continue; }
+        echo "Skill 目录列表:"
+        for d in "$SKILLS_DIR"/*; do
+          [ -d "$d" ] && basename "$d"
+        done
+        if ! ls -1 "$SKILLS_DIR"/*/ >/dev/null 2>&1; then
+          echo "暂无 Skill 目录。"
+        fi
+        pause
+        ;;
+      2)
+        sync_codex_dirs
+        ensure_dir "$SKILLS_DIR" "Skills" || { pause; continue; }
+        read -r -p "请输入要查看的 Skill 名称（留空取消）: " name
+        if [ -z "$name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        local dir file
+        dir="$(skill_dir_from_name "$name")"
+        file="$dir/SKILL.md"
+        if [ -f "$file" ]; then
+          echo "SKILL.md 内容:"
+          cat "$file"
+        else
+          echo "未找到：$file"
+        fi
+        pause
+        ;;
+      3)
+        sync_codex_dirs
+        ensure_dir "$SKILLS_DIR" "Skills" || { pause; continue; }
+        read -r -p "请输入 Skill 名称（留空取消）: " name
+        if [ -z "$name" ]; then
+          echo "未输入，已取消。"
+          pause
+          continue
+        fi
+        local dir file
+        dir="$(skill_dir_from_name "$name")"
+        file="$dir/SKILL.md"
+        if [ ! -d "$dir" ]; then
+          mkdir -p "$dir" || { echo "创建失败：$dir"; pause; continue; }
+        fi
+        if [ -f "$file" ]; then
+          echo "已存在：$file"
+        else
+          printf "" > "$file" || { echo "创建失败：$file"; pause; continue; }
+          echo "已创建：$file"
+        fi
+        read -r -p "是否立即编辑？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          vim "$file"
+        fi
+        pause
+        ;;
+      4)
+        sync_codex_dirs
+        ensure_dir "$SKILLS_DIR" "Skills" || { pause; continue; }
+        local items=()
+        local d
+        for d in "$SKILLS_DIR"/*; do
+          [ -d "$d" ] && items+=( "$(basename "$d")" )
+        done
+        if [ "${#items[@]}" -eq 0 ]; then
+          echo "暂无 Skill 目录。"
+          pause
+          continue
+        fi
+        echo "可删除的 Skill："
+        local i=1
+        local item
+        for item in "${items[@]}"; do
+          echo "${i}. ${item}"
+          i=$((i + 1))
+        done
+        read -r -p "输入序号（留空取消）: " idx
+        if [ -z "$idx" ]; then
+          echo "已取消。"
+          pause
+          continue
+        fi
+        if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#items[@]}" ]; then
+          echo "无效序号。"
+          pause
+          continue
+        fi
+        local dir
+        dir="$SKILLS_DIR/${items[$((idx - 1))]}"
+        if [ ! -d "$dir" ]; then
+          echo "未找到：$dir"
+          pause
+          continue
+        fi
+        read -r -p "确认删除 $dir ? [y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          trash_move "$dir" "skill"
+        else
+          echo "已取消。"
+        fi
+        pause
+        ;;
+      5)
+        sync_codex_dirs
+        ensure_dir "$SKILLS_DIR" "Skills" || { pause; continue; }
+        local items=()
+        local d
+        for d in "$SKILLS_DIR"/*; do
+          [ -d "$d" ] && items+=( "$(basename "$d")" )
+        done
+        if [ "${#items[@]}" -eq 0 ]; then
+          echo "暂无 Skill 目录，已取消。"
+          pause
+        else
+          echo "可编辑的 Skill："
+          local i=1 item
+          for item in "${items[@]}"; do
+            echo "${i}. ${item}"
+            i=$((i + 1))
+          done
+          read -r -p "输入序号（留空取消）: " idx
+          if [ -z "$idx" ]; then
+            echo "已取消。"
+            pause
+          else
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#items[@]}" ]; then
+              echo "无效序号。"
+            else
+              vim "$SKILLS_DIR/${items[$((idx - 1))]}/SKILL.md"
+            fi
+          fi
+        fi
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。"
+        ;;
+    esac
+  done
+}
+
+service_menu() {
+  while true; do
+    echo
+    local choice
+    choice="$(menu_choose "重启/重载 Codex 服务" \
+      "重启服务" \
+      "重载服务" \
+      "查看服务状态" \
+      "返回主菜单")"
+    if [ -z "$choice" ]; then
+      return
+    fi
+    case "$choice" in
+      1)
+        if command -v systemctl >/dev/null 2>&1; then
+          read -r -p "确认重启 $SERVICE_UNIT 服务？[y/N] " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            sudo systemctl restart "$SERVICE_UNIT"
+          fi
+        else
+          echo "未检测到 systemctl，无法重启服务。"
+        fi
+        pause
+        ;;
+      2)
+        if command -v systemctl >/dev/null 2>&1; then
+          read -r -p "确认重载 $SERVICE_UNIT 服务？[y/N] " ans
+          if [[ "$ans" =~ ^[Yy]$ ]]; then
+            sudo systemctl reload "$SERVICE_UNIT"
+          fi
+        else
+          echo "未检测到 systemctl，无法重载服务。"
+        fi
+        pause
+        ;;
+      3)
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl status "$SERVICE_UNIT" --no-pager
+        else
+          echo "未检测到 systemctl，无法查看服务状态。"
+        fi
+        pause
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。"
+        ;;
+    esac
+  done
+}
+
+main() {
+  while true; do
+    dashboard
+    local choice
+    if use_fzf; then
+    choice="$(menu_choose "主菜单" \
+      "API 和模型管理" \
+      "提示词 (Prompt) 管理" \
+      "MCP (上下文协议) 管理" \
+      "Skill (技能/工具) 管理" \
+      "重启/重载 Codex 服务" \
+      "退出脚本")"
+      if [ -z "$choice" ]; then
+        continue
+      fi
+    else
+      if [ -n "$C_CYAN" ]; then
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 1 "$C_RESET" "API 和模型管理"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 2 "$C_RESET" "提示词 (Prompt) 管理"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 3 "$C_RESET" "MCP (上下文协议) 管理"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 4 "$C_RESET" "Skill (技能/工具) 管理"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 5 "$C_RESET" "重启/重载 Codex 服务"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 0 "$C_RESET" "退出脚本"
+      else
+        printf "[ %d ] %s\n" 1 "API 和模型管理"
+        printf "[ %d ] %s\n" 2 "提示词 (Prompt) 管理"
+        printf "[ %d ] %s\n" 3 "MCP (上下文协议) 管理"
+        printf "[ %d ] %s\n" 4 "Skill (技能/工具) 管理"
+        printf "[ %d ] %s\n" 5 "重启/重载 Codex 服务"
+        printf "[ %d ] %s\n" 0 "退出脚本"
+      fi
+      echo
+      read -r -p "codex-core $(prompt_symbol) 请输入对应数字选择 [0-5]: " choice
+      if [ -z "$choice" ]; then
+        continue
+      fi
+    fi
+    case "$choice" in
+      1) api_menu ;;
+      2) prompt_menu ;;
+      3) mcp_menu ;;
+      4) skill_menu ;;
+      5) service_menu ;;
+      0) echo "退出脚本。"; exit 0 ;;
+      *) echo "无效选择。" ;;
+    esac
+  done
+}
+
+main
