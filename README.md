@@ -21,6 +21,12 @@
 - `vim`（深度编辑）
 - （可选）`fzf`（高级菜单）
 
+## 支持平台
+- **Linux / macOS**：原生支持，可直接安装使用
+- **Windows**：需要满足以下任一条件
+  - 使用 **WSL**（推荐，Ubuntu 等发行版）
+  - 使用 **Git Bash / MSYS2**（可运行，但依赖与路径需自行处理）
+
 ## 一键安装（推荐）
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JY1003/Codex-core/main/install.sh | bash
@@ -29,6 +35,10 @@ curl -fsSL https://raw.githubusercontent.com/JY1003/Codex-core/main/install.sh |
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JY1003/Codex-core/main/install.sh | sudo bash
 ```
+说明：
+- 脚本会尝试自动安装缺失依赖（需要 root 或 sudo 权限）
+- 无法自动安装时会提示缺失项，不影响脚本本体安装
+- macOS 下如果通过 `sudo bash` 执行，Homebrew 可能无法自动安装依赖，请先用当前用户安装依赖
 
 ## 手动安装
 1. 克隆仓库

@@ -9,13 +9,98 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-warn_missing_deps() {
+is_root() {
+  [ "$(id -u)" -eq 0 ]
+}
+
+have_sudo() {
+  need_cmd sudo
+}
+
+run_root() {
+  if is_root; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+collect_missing_deps() {
   local missing=()
   for cmd in bash curl jq python3; do
     if ! need_cmd "$cmd"; then
       missing+=( "$cmd" )
     fi
   done
+  printf '%s\n' "${missing[@]}"
+}
+
+install_deps_linux() {
+  local pkgs=("$@")
+  if need_cmd apt-get; then
+    run_root apt-get update -y && run_root apt-get install -y "${pkgs[@]}"
+    return $?
+  fi
+  if need_cmd dnf; then
+    run_root dnf install -y "${pkgs[@]}"
+    return $?
+  fi
+  if need_cmd yum; then
+    run_root yum install -y "${pkgs[@]}"
+    return $?
+  fi
+  if need_cmd pacman; then
+    run_root pacman -Sy --noconfirm "${pkgs[@]}"
+    return $?
+  fi
+  if need_cmd zypper; then
+    run_root zypper install -y "${pkgs[@]}"
+    return $?
+  fi
+  if need_cmd apk; then
+    run_root apk add --no-cache "${pkgs[@]}"
+    return $?
+  fi
+  return 1
+}
+
+install_deps_macos() {
+  local pkgs=("$@")
+  if need_cmd brew; then
+    brew install "${pkgs[@]}"
+    return $?
+  fi
+  return 1
+}
+
+try_install_missing_deps() {
+  local missing=("$@")
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
+  fi
+  if ! is_root && ! have_sudo; then
+    return 1
+  fi
+  local os
+  os="$(uname -s 2>/dev/null || echo "")"
+  case "$os" in
+    Darwin)
+      if is_root; then
+        return 1
+      fi
+      install_deps_macos "${missing[@]}"
+      return $?
+      ;;
+    Linux)
+      install_deps_linux "${missing[@]}"
+      return $?
+      ;;
+  esac
+  return 1
+}
+
+warn_missing_deps() {
+  local missing=("$@")
   if [ "${#missing[@]}" -gt 0 ]; then
     printf "警告：缺少依赖：%s\n" "${missing[*]}" >&2
     printf "脚本仍可安装，但运行功能可能受限。\n" >&2
@@ -42,7 +127,13 @@ pick_install_dir() {
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install_dir="$(pick_install_dir)"
 
-warn_missing_deps
+mapfile -t missing_deps < <(collect_missing_deps)
+if [ "${#missing_deps[@]}" -gt 0 ]; then
+  if try_install_missing_deps "${missing_deps[@]}"; then
+    mapfile -t missing_deps < <(collect_missing_deps)
+  fi
+  warn_missing_deps "${missing_deps[@]}"
+fi
 
 src_path=""
 if [ -f "$script_dir/$SCRIPT_NAME" ]; then
