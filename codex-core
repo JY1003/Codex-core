@@ -594,6 +594,9 @@ sync_codex_dirs() {
   if [ -z "$TRASH_DIR" ]; then
     TRASH_DIR="$CODEX_DIR/trash"
   fi
+  if [ "$AUTH_PATH" = "/root/.codex/auth.json" ] && [ -n "$CODEX_DIR" ]; then
+    AUTH_PATH="$CODEX_DIR/auth.json"
+  fi
 }
 
 ensure_dir() {
@@ -770,9 +773,31 @@ sed_inplace() {
   if sed --version >/dev/null 2>&1; then
     sed -i "$expr" "$file"
   else
-    sed -i '' "$expr" "$file"
+    sed -i '' -e "$expr" "$file"
   fi
 }
+
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf "%s" "$s"
+}
+
+if ! command -v mapfile >/dev/null 2>&1; then
+  mapfile() {
+    if [ "$1" != "-t" ]; then
+      echo "mapfile: unsupported options" >&2
+      return 1
+    fi
+    local var="$2"
+    local line
+    eval "$var=()"
+    while IFS= read -r line; do
+      eval "$var+=(\"\$line\")"
+    done
+  }
+fi
 
 toml_replace_model() {
   local value="$1"
@@ -1901,8 +1926,11 @@ api_menu() {
           pause
           continue
         fi
+        profile_name="$(trim_ws "$profile_name")"
         read -r -p "请输入 API 地址（留空取消）: " new_api
         read -r -p "请输入 Token（留空取消）: " new_token
+        new_api="$(trim_ws "$new_api")"
+        new_token="$(trim_ws "$new_token")"
         if [ -z "$new_api" ] || [ -z "$new_token" ]; then
           echo "未输入，已取消。"
           pause
@@ -2058,6 +2086,7 @@ api_menu() {
         read -r -p "是否更新 Token？[y/N] " ans
         if [[ "$ans" =~ ^[Yy]$ ]]; then
           read -r -p "请输入新的 Token（留空不变）: " new_token
+          new_token="$(trim_ws "$new_token")"
           if [ -n "$new_token" ]; then
             if set_token_value "$new_token"; then
               changed=1
@@ -2207,6 +2236,8 @@ api_menu() {
               model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
               read -r -p "API 地址（留空不变，当前: ${api_url:-<空>}）: " new_api
               read -r -p "Token（留空不变）: " new_token
+              new_api="$(trim_ws "$new_api")"
+              new_token="$(trim_ws "$new_token")"
               [ -n "$new_api" ] && api_url="$new_api"
               [ -n "$new_token" ] && token="$new_token"
               local models model_choice
