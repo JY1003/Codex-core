@@ -844,6 +844,23 @@ else:
 PY
 }
 
+toml_fallback_model() {
+  grep -m1 '^model = ' "$CONFIG_PATH" | sed -E 's/.*"([^"]*)".*/\1/'
+}
+
+toml_fallback_base_url() {
+  local provider
+  provider="$(grep -m1 '^model_provider = ' "$CONFIG_PATH" | sed -E 's/.*"([^"]*)".*/\1/')"
+  if [ -n "$provider" ]; then
+    awk -v p="$provider" '
+      $0 ~ "^\\[model_providers\\."p"\\]$" {in=1; next}
+      /^\[/ { if(in){exit} }
+      in && /^base_url\\s*=/ {gsub(/.*\"/,""); gsub(/\".*/,""); print; exit}
+    ' "$CONFIG_PATH"
+  else
+    grep -m1 '^base_url = ' "$CONFIG_PATH" | sed -E 's/.*"([^"]*)".*/\1/'
+  fi
+}
 toml_exists() {
   local path="$1"
   require_python || return 1
@@ -1802,6 +1819,14 @@ dashboard() {
     sync_paths
     api_url="$(get_config_value "$API_URL_PATH")"
     model="$(get_config_value "$MODEL_PATH")"
+    if [ "$CONFIG_FORMAT" = "toml" ]; then
+      if [ -z "$api_url" ]; then
+        api_url="$(toml_fallback_base_url)"
+      fi
+      if [ -z "$model" ]; then
+        model="$(toml_fallback_model)"
+      fi
+    fi
     if [ "$CONFIG_FORMAT" = "toml" ]; then
       mcp_count="$(toml_mcp_count)"
       skill_count="$(find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
@@ -3185,6 +3210,14 @@ skill_menu() {
   done
 }
 
+service_unit_exists() {
+  local unit="${SERVICE_UNIT}.service"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+  systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$unit"
+}
+
 service_menu() {
   while true; do
     echo
@@ -3200,6 +3233,12 @@ service_menu() {
     case "$choice" in
       1)
         if command -v systemctl >/dev/null 2>&1; then
+          if ! service_unit_exists; then
+            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
+            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
+            pause
+            continue
+          fi
           read -r -p "确认重启 $SERVICE_UNIT 服务？[y/N] " ans
           if [[ "$ans" =~ ^[Yy]$ ]]; then
             sudo systemctl restart "$SERVICE_UNIT"
@@ -3211,6 +3250,12 @@ service_menu() {
         ;;
       2)
         if command -v systemctl >/dev/null 2>&1; then
+          if ! service_unit_exists; then
+            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
+            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
+            pause
+            continue
+          fi
           read -r -p "确认重载 $SERVICE_UNIT 服务？[y/N] " ans
           if [[ "$ans" =~ ^[Yy]$ ]]; then
             sudo systemctl reload "$SERVICE_UNIT"
@@ -3222,6 +3267,12 @@ service_menu() {
         ;;
       3)
         if command -v systemctl >/dev/null 2>&1; then
+          if ! service_unit_exists; then
+            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
+            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
+            pause
+            continue
+          fi
           systemctl status "$SERVICE_UNIT" --no-pager
         else
           echo "未检测到 systemctl，无法查看服务状态。"

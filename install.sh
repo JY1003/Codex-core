@@ -26,13 +26,14 @@ run_root() {
 }
 
 collect_missing_deps() {
-  local missing=()
+  local missing=""
+  local cmd
   for cmd in bash curl jq python3; do
     if ! need_cmd "$cmd"; then
-      missing+=( "$cmd" )
+      missing="${missing}${cmd}\n"
     fi
   done
-  printf '%s\n' "${missing[@]}"
+  printf "%b" "$missing"
 }
 
 install_deps_linux() {
@@ -74,8 +75,8 @@ install_deps_macos() {
 }
 
 try_install_missing_deps() {
-  local missing=("$@")
-  if [ "${#missing[@]}" -eq 0 ]; then
+  local missing_list="$1"
+  if [ -z "$missing_list" ]; then
     return 0
   fi
   if ! is_root && ! have_sudo; then
@@ -88,11 +89,13 @@ try_install_missing_deps() {
       if is_root; then
         return 1
       fi
-      install_deps_macos "${missing[@]}"
+      # shellcheck disable=SC2086
+      install_deps_macos $missing_list
       return $?
       ;;
     Linux)
-      install_deps_linux "${missing[@]}"
+      # shellcheck disable=SC2086
+      install_deps_linux $missing_list
       return $?
       ;;
   esac
@@ -100,9 +103,9 @@ try_install_missing_deps() {
 }
 
 warn_missing_deps() {
-  local missing=("$@")
-  if [ "${#missing[@]}" -gt 0 ]; then
-    printf "警告：缺少依赖：%s\n" "${missing[*]}" >&2
+  local missing_list="$1"
+  if [ -n "$missing_list" ]; then
+    printf "警告：缺少依赖：%s\n" "$missing_list" >&2
     printf "脚本仍可安装，但运行功能可能受限。\n" >&2
   fi
 }
@@ -124,15 +127,18 @@ pick_install_dir() {
   echo "/tmp"
 }
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_source="${BASH_SOURCE[0]-$0}"
+script_dir="$(cd "$(dirname "$script_source")" && pwd)"
 install_dir="$(pick_install_dir)"
 
-mapfile -t missing_deps < <(collect_missing_deps)
-if [ "${#missing_deps[@]}" -gt 0 ]; then
-  if try_install_missing_deps "${missing_deps[@]}"; then
-    mapfile -t missing_deps < <(collect_missing_deps)
+missing_deps="$(collect_missing_deps)"
+missing_deps="$(printf "%s" "$missing_deps" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
+if [ -n "$missing_deps" ]; then
+  if try_install_missing_deps "$missing_deps"; then
+    missing_deps="$(collect_missing_deps)"
+    missing_deps="$(printf "%s" "$missing_deps" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
   fi
-  warn_missing_deps "${missing_deps[@]}"
+  warn_missing_deps "$missing_deps"
 fi
 
 src_path=""
