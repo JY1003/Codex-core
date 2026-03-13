@@ -818,9 +818,9 @@ toml_replace_base_url() {
   escaped="$(sed_escape "$value")"
   if grep -q "^\\[model_providers\\.${provider}\\]" "$CONFIG_PATH"; then
     awk -v p="$provider" -v v="$escaped" '
-      $0 ~ "^\\[model_providers\\."p"\\]$" {in=1; print; next}
-      /^\[/ { if(in){in=0} }
-      in && /^base_url\\s*=/ {print "base_url = \""v"\""; next}
+      $0 ~ "^\\[model_providers\\."p"\\]$" {inside=1; print; next}
+      /^\[/ { if(inside){inside=0} }
+      inside && /^base_url\\s*=/ {print "base_url = \""v"\""; next}
       {print}
     ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     return 0
