@@ -142,9 +142,16 @@ if [ -n "$missing_deps" ]; then
 fi
 
 src_path=""
-if [ -f "$script_dir/$SCRIPT_NAME" ]; then
-  src_path="$script_dir/$SCRIPT_NAME"
+force_remote="${FORCE_REMOTE:-0}"
+if [ "$force_remote" = "1" ]; then
+  src_path=""
 else
+  if [ -f "$script_dir/$SCRIPT_NAME" ]; then
+    src_path="$script_dir/$SCRIPT_NAME"
+  fi
+fi
+
+if [ -z "$src_path" ]; then
   if ! need_cmd curl; then
     echo "未检测到 curl，无法下载脚本。" >&2
     exit 1
