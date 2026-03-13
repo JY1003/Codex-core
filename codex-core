@@ -764,12 +764,22 @@ sed_escape() {
   printf '%s' "$1" | sed -e 's/[\\/&"]/\\&/g'
 }
 
+sed_inplace() {
+  local expr="$1"
+  local file="$2"
+  if sed --version >/dev/null 2>&1; then
+    sed -i "$expr" "$file"
+  else
+    sed -i '' "$expr" "$file"
+  fi
+}
+
 toml_replace_model() {
   local value="$1"
   local escaped
   escaped="$(sed_escape "$value")"
   if grep -q '^model = ' "$CONFIG_PATH"; then
-    sed -i "s/^model = .*/model = \"${escaped}\"/" "$CONFIG_PATH"
+    sed_inplace "s/^model = .*/model = \"${escaped}\"/" "$CONFIG_PATH"
     return 0
   fi
   echo "未找到 model 行，无法修改。"
@@ -782,11 +792,11 @@ toml_replace_base_url() {
   local escaped
   escaped="$(sed_escape "$value")"
   if grep -q "^\\[model_providers\\.${provider}\\]" "$CONFIG_PATH"; then
-    sed -i "/^\\[model_providers\\.${provider}\\]/,/^\\[/{s|^base_url = .*|base_url = \"${escaped}\"|}" "$CONFIG_PATH"
+    sed_inplace "/^\\[model_providers\\.${provider}\\]/,/^\\[/{s|^base_url = .*|base_url = \"${escaped}\"|}" "$CONFIG_PATH"
     return 0
   fi
   if grep -q '^base_url = ' "$CONFIG_PATH"; then
-    sed -i "s|^base_url = .*|base_url = \"${escaped}\"|" "$CONFIG_PATH"
+    sed_inplace "s|^base_url = .*|base_url = \"${escaped}\"|" "$CONFIG_PATH"
     return 0
   fi
   echo "未找到 base_url 行，无法修改。"
@@ -1081,6 +1091,10 @@ set_token_value() {
     backup_auth
     jq --arg k "$auth_key" --arg v "$value" '.[$k]=$v' "$AUTH_PATH" > "$AUTH_PATH.tmp" && mv "$AUTH_PATH.tmp" "$AUTH_PATH"
   else
+    if [ "$CONFIG_FORMAT" = "toml" ]; then
+      echo "TOML 模式下未发现鉴权文件 $AUTH_PATH，已跳过 Token 写入。"
+      return 0
+    fi
     set_config_value "$API_TOKEN_PATH" "$value"
   fi
 }
