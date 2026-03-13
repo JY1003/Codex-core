@@ -817,11 +817,19 @@ toml_replace_base_url() {
   local escaped
   escaped="$(sed_escape "$value")"
   if grep -q "^\\[model_providers\\.${provider}\\]" "$CONFIG_PATH"; then
-    sed_inplace "/^\\[model_providers\\.${provider}\\]/,/^\\[/{s|^base_url = .*|base_url = \"${escaped}\"|}" "$CONFIG_PATH"
+    awk -v p="$provider" -v v="$escaped" '
+      $0 ~ "^\\[model_providers\\."p"\\]$" {in=1; print; next}
+      /^\[/ { if(in){in=0} }
+      in && /^base_url\\s*=/ {print "base_url = \""v"\""; next}
+      {print}
+    ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     return 0
   fi
   if grep -q '^base_url = ' "$CONFIG_PATH"; then
-    sed_inplace "s|^base_url = .*|base_url = \"${escaped}\"|" "$CONFIG_PATH"
+    awk -v v="$escaped" '
+      /^base_url\\s*=/ {print "base_url = \""v"\""; next}
+      {print}
+    ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     return 0
   fi
   echo "未找到 base_url 行，无法修改。"
