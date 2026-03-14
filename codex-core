@@ -317,7 +317,7 @@ toml_mcp_add_or_update() {
   backup_config
   toml_mcp_remove_any_block "$name"
   local escaped_url
-  escaped_url="$(sed_escape "$url")"
+  escaped_url="$(toml_escape_basic "$url")"
   {
     printf "\n[mcp_servers.%s]\n" "$name"
     printf "url = \"%s\"\n" "$escaped_url"
@@ -767,6 +767,20 @@ sed_escape() {
   printf '%s' "$1" | sed -e 's/[\\/&"]/\\&/g'
 }
 
+toml_escape_basic() {
+  local value="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$value" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+    return 0
+  fi
+  python3 - "$value" <<'PY'
+import sys
+v = sys.argv[1]
+v = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+print(v)
+PY
+}
+
 sed_inplace() {
   local expr="$1"
   local file="$2"
@@ -802,38 +816,67 @@ fi
 toml_replace_model() {
   local value="$1"
   local escaped
-  escaped="$(sed_escape "$value")"
-  if grep -q '^model = ' "$CONFIG_PATH"; then
-    sed_inplace "s/^model = .*/model = \"${escaped}\"/" "$CONFIG_PATH"
-    return 0
-  fi
-  echo "未找到 model 行，无法修改。"
-  return 1
+  escaped="$(toml_escape_basic "$value")"
+  awk -v v="$escaped" '
+    BEGIN { found=0; inserted=0; before_section=1 }
+    function emit_model() {
+      if (!inserted) { print "model = \""v"\""; inserted=1 }
+    }
+    /^\s*\[/ {
+      if (before_section) {
+        if (!found) { emit_model() }
+        before_section=0
+      }
+      print; next
+    }
+    {
+      if (before_section && $0 ~ /^[[:space:]]*model[[:space:]]*=/) {
+        if (!found) {
+          print "model = \""v"\""
+          found=1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (before_section && !found) { emit_model() }
+    }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+  return 0
 }
 
 toml_replace_base_url() {
   local provider="$1"
   local value="$2"
   local escaped
-  escaped="$(sed_escape "$value")"
-  if grep -q "^\\[model_providers\\.${provider}\\]" "$CONFIG_PATH"; then
+  escaped="$(toml_escape_basic "$value")"
+  if [ -z "$provider" ]; then
+    return 1
+  fi
+  if grep -q "^\\[model_providers\\.${provider}\\]$" "$CONFIG_PATH"; then
     awk -v p="$provider" -v v="$escaped" '
-      $0 ~ "^\\[model_providers\\."p"\\]$" {inside=1; print; next}
-      /^\[/ { if(inside){inside=0} }
-      inside && /^base_url\\s*=/ {print "base_url = \""v"\""; next}
+      function emit_once() {
+        if (!emitted) { print "base_url = \""v"\""; emitted=1 }
+      }
+      $0 ~ "^\\[model_providers\\."p"\\]$" {in_section=1; emitted=0; print; next}
+      /^\[/ {
+        if (in_section) { emit_once(); in_section=0 }
+        print; next
+      }
+      in_section {
+        if ($0 ~ /^[[:space:]]*base_url[[:space:]]*=/) { next }
+        if (!emitted && $0 !~ /^[[:space:]]*$/) { emit_once() }
+        print; next
+      }
       {print}
+      END { if (in_section) { emit_once() } }
     ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     return 0
   fi
-  if grep -q '^base_url = ' "$CONFIG_PATH"; then
-    awk -v v="$escaped" '
-      /^base_url\\s*=/ {print "base_url = \""v"\""; next}
-      {print}
-    ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-    return 0
-  fi
-  echo "未找到 base_url 行，无法修改。"
-  return 1
+  printf "\n[model_providers.%s]\n" "$provider" >> "$CONFIG_PATH"
+  printf "base_url = \"%s\"\n" "$escaped" >> "$CONFIG_PATH"
+  return 0
 }
 
 path_to_jq_array() {
@@ -896,9 +939,9 @@ toml_fallback_base_url() {
   provider="$(grep -m1 '^model_provider = ' "$CONFIG_PATH" | sed -E 's/.*"([^"]*)".*/\1/')"
   if [ -n "$provider" ]; then
     awk -v p="$provider" '
-      $0 ~ "^\\[model_providers\\."p"\\]$" {in=1; next}
-      /^\[/ { if(in){exit} }
-      in && /^base_url\\s*=/ {gsub(/.*\"/,""); gsub(/\".*/,""); print; exit}
+      $0 ~ "^\\[model_providers\\."p"\\]$" {inside=1; next}
+      /^\[/ { if(inside){exit} }
+      inside && /^[[:space:]]*base_url[[:space:]]*=/ {gsub(/.*\"/,""); gsub(/\".*/,""); print; exit}
     ' "$CONFIG_PATH"
   else
     grep -m1 '^base_url = ' "$CONFIG_PATH" | sed -E 's/.*"([^"]*)".*/\1/'
@@ -1917,10 +1960,10 @@ api_menu() {
     local choice
     choice="$(menu_choose "API 和模型管理" \
       "新增 API 地址与 Token" \
-      "修改当前模型" \
+      "列出配置" \
+      "切换模型" \
       "快速切换预设配置 (OpenAI / Anthropic)" \
-      "配置管理 (新增/切换/修改/删除)" \
-      "返回主菜单")"
+      "返回")"
     if [ -z "$choice" ]; then
       return
     fi
@@ -1996,6 +2039,159 @@ api_menu() {
         pause
         ;;
       2)
+        profiles_init || { pause; continue; }
+        mapfile -t names < <(profiles_list)
+        if [ "${#names[@]}" -eq 0 ]; then
+          echo "暂无配置。"
+          pause
+          continue
+        fi
+        echo "已保存的配置："
+        local i=1 sel
+        for sel in "${names[@]}"; do
+          local api model
+          api="$(jq -r --arg n "$sel" '.profiles[$n].api_url // ""' "$API_PROFILES_PATH")"
+          model="$(jq -r --arg n "$sel" '.profiles[$n].model // ""' "$API_PROFILES_PATH")"
+          echo "${i}. ${sel} | ${api} | ${model}"
+          i=$((i + 1))
+        done
+        local action
+        action="$(menu_choose "配置操作" "切换" "修改" "删除" "返回")"
+        case "$action" in
+          1)
+            read -r -p "选择要切换的配置序号（留空返回）: " idx
+            if [ -z "$idx" ]; then
+              pause
+              continue
+            fi
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+              echo "无效序号。"
+              pause
+              continue
+            fi
+            local name api_url token model
+            name="${names[$((idx - 1))]}"
+            api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
+            token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
+            model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
+            ensure_config || { pause; continue; }
+            sync_paths
+            backup_config
+            if [ -n "$api_url" ]; then
+              set_config_value "$API_URL_PATH" "$api_url" || { echo "切换失败。"; restore_backup; pause; continue; }
+            fi
+            if [ -n "$token" ]; then
+              set_token_value "$token" || { echo "切换失败。"; restore_backup; pause; continue; }
+            fi
+            if [ -n "$model" ]; then
+              set_config_value "$MODEL_PATH" "$model" || { echo "切换失败。"; restore_backup; pause; continue; }
+            fi
+            local models model_choice
+            fetch_models_into models "$api_url" "$token"
+            if [ "${#models[@]}" -gt 0 ]; then
+              mapfile -t models < <(filter_codex_models "${models[@]}")
+            fi
+            if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+              echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+            fi
+            if [ "${#models[@]}" -gt 0 ]; then
+              echo "可用模型列表："
+              model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+              if [ -n "$model_choice" ]; then
+                if set_config_value "$MODEL_PATH" "$model_choice"; then
+                  profiles_set "$name" "$api_url" "$token" "$model_choice"
+                  model="$model_choice"
+                else
+                  echo "修改模型失败，已取消。"
+                  restore_backup
+                  pause
+                  continue
+                fi
+              fi
+            fi
+            echo "已切换到配置：$name"
+            validate_or_rollback
+            pause
+            ;;
+          2)
+            read -r -p "选择要修改的配置序号（留空返回）: " idx
+            if [ -z "$idx" ]; then
+              pause
+              continue
+            fi
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+              echo "无效序号。"
+              pause
+              continue
+            fi
+            local name api_url token model
+            name="${names[$((idx - 1))]}"
+            api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
+            token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
+            model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
+            echo "当前配置：$name"
+            echo "API：${api_url:-<空>}"
+            echo "Token：${token:-<空>}"
+            echo "模型：${model:-<空>}"
+            read -r -p "新的 API 地址（留空保持）: " new_api
+            read -r -p "新的 Token（留空保持）: " new_token
+            new_api="$(trim_ws "$new_api")"
+            new_token="$(trim_ws "$new_token")"
+            if [ -n "$new_api" ]; then
+              api_url="$new_api"
+            fi
+            if [ -n "$new_token" ]; then
+              token="$new_token"
+            fi
+            local models model_choice
+            fetch_models_into models "$api_url" "$token"
+            if [ "${#models[@]}" -gt 0 ]; then
+              mapfile -t models < <(filter_codex_models "${models[@]}")
+            fi
+            if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
+              echo "模型列表获取失败：$MODEL_FETCH_ERROR"
+            fi
+            if [ "${#models[@]}" -gt 0 ]; then
+              echo "可用模型列表："
+              model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
+              if [ -n "$model_choice" ]; then
+                model="$model_choice"
+              fi
+            fi
+            profiles_set "$name" "$api_url" "$token" "$model" && echo "已更新配置：$name"
+            pause
+            ;;
+          3)
+            echo "请输入要删除的配置序号，可多选（如 1 3 5 或 1,3,5），留空取消。"
+            read -r -p "序号: " list
+            list="$(trim_ws "$list")"
+            if [ -z "$list" ]; then
+              echo "已取消。"
+              pause
+              continue
+            fi
+            list="${list//,/ }"
+            local del_any=0
+            for idx in $list; do
+              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
+                echo "跳过无效序号：$idx"
+                continue
+              fi
+              local del_name
+              del_name="${names[$((idx - 1))]}"
+              profiles_delete "$del_name" && echo "已删除：$del_name"
+              del_any=1
+            done
+            if [ "$del_any" -eq 0 ]; then
+              echo "未删除任何配置。"
+            fi
+            pause
+            ;;
+          0) ;;
+          *) echo "无效选择。" ; pause ;;
+        esac
+        ;;
+      3)
         ensure_config || { pause; continue; }
         if [ "$CONFIG_FORMAT" = "json" ]; then
           require_jq || { pause; continue; }
@@ -2026,287 +2222,48 @@ api_menu() {
             fi
           else
             echo "模型保持不变。"
-            pause
-            continue
           fi
         else
-          read -r -p "请输入新的模型名称（留空不变）: " new_model
-          if [ -n "$new_model" ]; then
-            if set_config_value "$MODEL_PATH" "$new_model"; then
-              echo "已更新模型。"
-            else
-              echo "修改模型失败，已取消。"
-              restore_backup
-              pause
-              continue
-            fi
-          else
-            echo "模型保持不变。"
-            pause
-            continue
-          fi
+          echo "未能获取模型列表，跳过模型设置。"
         fi
         validate_or_rollback
         pause
         ;;
-      3)
+      4)
         ensure_config || { pause; continue; }
         if [ "$CONFIG_FORMAT" = "json" ]; then
           require_jq || { pause; continue; }
         fi
+        sync_paths
         backup_config
-        local changed=0
-        echo "1. OpenAI 预设"
-        echo "2. Anthropic 预设"
-        read -r -p "请选择（留空取消）: " preset
-        if [ -z "$preset" ]; then
-          echo "未输入，已取消。"
-          pause
-          continue
-        fi
+        local preset
+        preset="$(menu_choose "快速切换预设配置" \
+          "OpenAI" \
+          "Anthropic" \
+          "返回")"
         case "$preset" in
           1)
             if set_config_value "$API_URL_PATH" "$OPENAI_API_URL" && set_config_value "$MODEL_PATH" "$OPENAI_MODEL"; then
-              changed=1
+              echo "已切换到 OpenAI 预设配置。"
+              validate_or_rollback
             else
-              echo "预设切换失败，已取消。"
+              echo "切换失败，已取消。"
               restore_backup
-              pause
-              continue
             fi
-            echo "已切换到 OpenAI 预设。"
             ;;
           2)
             if set_config_value "$API_URL_PATH" "$ANTHROPIC_API_URL" && set_config_value "$MODEL_PATH" "$ANTHROPIC_MODEL"; then
-              changed=1
-            else
-              echo "预设切换失败，已取消。"
-              restore_backup
-              pause
-              continue
-            fi
-            echo "已切换到 Anthropic 预设。"
-            ;;
-          *)
-            echo "无效选择。"
-            ;;
-        esac
-        read -r -p "是否更新 Token？[y/N] " ans
-        if [[ "$ans" =~ ^[Yy]$ ]]; then
-          read -r -p "请输入新的 Token（留空不变）: " new_token
-          new_token="$(trim_ws "$new_token")"
-          if [ -n "$new_token" ]; then
-            if set_token_value "$new_token"; then
-              changed=1
-              echo "已更新 Token。"
-            else
-              echo "修改 Token 失败，已取消。"
-              restore_backup
-              pause
-              continue
-            fi
-          else
-            echo "Token 为空，保持不变。"
-          fi
-        fi
-        if [ "$changed" -eq 1 ]; then
-          validate_or_rollback
-        else
-          echo "没有任何变更，跳过校验。"
-        fi
-        pause
-        ;;
-      4)
-        profiles_init || { pause; continue; }
-        while true; do
-          echo
-          local pc
-          pc="$(menu_choose "配置管理" \
-            "列出配置" \
-            "切换配置" \
-            "修改配置" \
-            "删除配置" \
-            "返回")"
-          if [ -z "$pc" ]; then
-            break
-          fi
-          case "$pc" in
-            1)
-              echo "已保存的配置："
-              mapfile -t names < <(profiles_list)
-              if [ "${#names[@]}" -eq 0 ]; then
-                echo "暂无配置。"
-              else
-                local n
-                for n in "${names[@]}"; do
-                  local api model
-                  api="$(jq -r --arg n "$n" '.profiles[$n].api_url // ""' "$API_PROFILES_PATH")"
-                  model="$(jq -r --arg n "$n" '.profiles[$n].model // ""' "$API_PROFILES_PATH")"
-                  echo "- $n: ${api} | ${model}"
-                done
-              fi
-              pause
-              ;;
-            2)
-              mapfile -t names < <(profiles_list)
-              if [ "${#names[@]}" -eq 0 ]; then
-                echo "暂无配置。"
-                pause
-                continue
-              fi
-              echo "请选择要切换的配置："
-              local i=1 sel
-              for sel in "${names[@]}"; do
-                echo "${i}. ${sel}"
-                i=$((i + 1))
-              done
-              read -r -p "输入序号（留空取消）: " idx
-              if [ -z "$idx" ]; then
-                echo "已取消。"
-                pause
-                continue
-              fi
-              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
-                echo "无效序号。"
-                pause
-                continue
-              fi
-              local name api_url token model
-              name="${names[$((idx - 1))]}"
-              api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
-              token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
-              model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
-              backup_config
-              if [ -n "$api_url" ]; then
-                set_config_value "$API_URL_PATH" "$api_url" || { echo "切换失败。"; restore_backup; pause; continue; }
-              fi
-              if [ -n "$token" ]; then
-                set_token_value "$token" || { echo "切换失败。"; restore_backup; pause; continue; }
-              fi
-              if [ -n "$model" ]; then
-                set_config_value "$MODEL_PATH" "$model" || { echo "切换失败。"; restore_backup; pause; continue; }
-              fi
-              local models model_choice
-              fetch_models_into models "$api_url" "$token"
-              if [ "${#models[@]}" -gt 0 ]; then
-                mapfile -t models < <(filter_codex_models "${models[@]}")
-              fi
-              if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
-                echo "模型列表获取失败：$MODEL_FETCH_ERROR"
-              fi
-              if [ "${#models[@]}" -gt 0 ]; then
-                echo "可用模型列表："
-                model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
-                if [ -n "$model_choice" ]; then
-                  if set_config_value "$MODEL_PATH" "$model_choice"; then
-                    profiles_set "$name" "$api_url" "$token" "$model_choice"
-                    model="$model_choice"
-                  else
-                    echo "修改模型失败，已取消。"
-                    restore_backup
-                    pause
-                    continue
-                  fi
-                fi
-              fi
-              echo "已切换到配置：$name"
+              echo "已切换到 Anthropic 预设配置。"
               validate_or_rollback
-              pause
-              ;;
-            3)
-              mapfile -t names < <(profiles_list)
-              if [ "${#names[@]}" -eq 0 ]; then
-                echo "暂无配置。"
-                pause
-                continue
-              fi
-              echo "请选择要修改的配置："
-              local i=1 sel
-              for sel in "${names[@]}"; do
-                echo "${i}. ${sel}"
-                i=$((i + 1))
-              done
-              read -r -p "输入序号（留空取消）: " idx
-              if [ -z "$idx" ]; then
-                echo "已取消。"
-                pause
-                continue
-              fi
-              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
-                echo "无效序号。"
-                pause
-                continue
-              fi
-              local name api_url token model
-              name="${names[$((idx - 1))]}"
-              api_url="$(jq -r --arg n "$name" '.profiles[$n].api_url // empty' "$API_PROFILES_PATH")"
-              token="$(jq -r --arg n "$name" '.profiles[$n].token // empty' "$API_PROFILES_PATH")"
-              model="$(jq -r --arg n "$name" '.profiles[$n].model // empty' "$API_PROFILES_PATH")"
-              read -r -p "API 地址（留空不变，当前: ${api_url:-<空>}）: " new_api
-              read -r -p "Token（留空不变）: " new_token
-              new_api="$(trim_ws "$new_api")"
-              new_token="$(trim_ws "$new_token")"
-              [ -n "$new_api" ] && api_url="$new_api"
-              [ -n "$new_token" ] && token="$new_token"
-              local models model_choice
-              fetch_models_into models "$api_url" "$token"
-              if [ "${#models[@]}" -gt 0 ]; then
-                mapfile -t models < <(filter_codex_models "${models[@]}")
-              fi
-              if [ "${#models[@]}" -eq 0 ] && [ -n "$MODEL_FETCH_ERROR" ]; then
-                echo "模型列表获取失败：$MODEL_FETCH_ERROR"
-              fi
-              if [ "${#models[@]}" -gt 0 ]; then
-                echo "可用模型列表："
-                model_choice="$(select_model_or_name "输入序号或模型名（留空不变）: " "${models[@]}")"
-                if [ -n "$model_choice" ]; then
-                  model="$model_choice"
-                fi
-              else
-                read -r -p "模型（留空不变，当前: ${model:-<空>}）: " new_model
-                [ -n "$new_model" ] && model="$new_model"
-              fi
-              profiles_set "$name" "$api_url" "$token" "$model" && echo "已更新配置：$name"
-              pause
-              ;;
-            4)
-              mapfile -t names < <(profiles_list)
-              if [ "${#names[@]}" -eq 0 ]; then
-                echo "暂无配置。"
-                pause
-                continue
-              fi
-              echo "请选择要删除的配置："
-              local i=1 sel
-              for sel in "${names[@]}"; do
-                echo "${i}. ${sel}"
-                i=$((i + 1))
-              done
-              read -r -p "输入序号（留空取消）: " idx
-              if [ -z "$idx" ]; then
-                echo "已取消。"
-                pause
-                continue
-              fi
-              if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#names[@]}" ]; then
-                echo "无效序号。"
-                pause
-                continue
-              fi
-              local name
-              name="${names[$((idx - 1))]}"
-              read -r -p "确认删除配置 $name ? [y/N] " ans
-              if [[ "$ans" =~ ^[Yy]$ ]]; then
-                profiles_delete "$name" && echo "已删除：$name"
-              else
-                echo "已取消。"
-              fi
-              pause
-              ;;
-            0) break ;;
-            *) echo "无效选择。" ;;
-          esac
-        done
+            else
+              echo "切换失败，已取消。"
+              restore_backup
+            fi
+            ;;
+          0) ;;
+          *) echo "无效选择。" ;;
+        esac
+        pause
         ;;
       0)
         return
@@ -3274,61 +3231,78 @@ service_unit_exists() {
 service_menu() {
   while true; do
     echo
+    local lines
+    mapfile -t lines < <(pgrep -af "[c]odex" | grep -v "codex-core" | grep -v "cx")
+    if [ "${#lines[@]}" -eq 0 ]; then
+      echo "未发现 codex 进程。"
+      local empty_choice
+      empty_choice="$(menu_choose "Codex 进程" "返回主菜单")"
+      if [ -z "$empty_choice" ] || [ "$empty_choice" = "0" ]; then
+        return
+      fi
+      continue
+    fi
+    echo "当前 codex 进程："
+    local i=1 line
+    for line in "${lines[@]}"; do
+      local tag="other"
+      case "$line" in
+        *"tmux"*) tag="tmux" ;;
+        *"/bin/codex"*) tag="cli" ;;
+        *"/codex/codex"*) tag="core" ;;
+      esac
+      echo "${i}. $line [$tag]"
+      i=$((i + 1))
+    done
+    echo "总计：${#lines[@]} 个"
     local choice
-    choice="$(menu_choose "重启/重载 Codex 服务" \
-      "重启服务" \
-      "重载服务" \
-      "查看服务状态" \
+    choice="$(menu_choose "选择操作" \
+      "结束指定进程" \
+      "结束全部进程" \
       "返回主菜单")"
     if [ -z "$choice" ]; then
       return
     fi
     case "$choice" in
       1)
-        if command -v systemctl >/dev/null 2>&1; then
-          if ! service_unit_exists; then
-            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
-            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
-            pause
+        read -r -p "输入要结束的序号（可多选，如 1 3 或 1,3，留空取消）: " list
+        list="$(trim_ws "$list")"
+        if [ -z "$list" ]; then
+          echo "已取消。"
+          pause
+          continue
+        fi
+        list="${list//,/ }"
+        local killed=0
+        for idx in $list; do
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#lines[@]}" ]; then
+            echo "跳过无效序号：$idx"
             continue
           fi
-          read -r -p "确认重启 $SERVICE_UNIT 服务？[y/N] " ans
-          if [[ "$ans" =~ ^[Yy]$ ]]; then
-            sudo systemctl restart "$SERVICE_UNIT"
+          local pid
+          pid="$(echo "${lines[$((idx - 1))]}" | awk '{print $1}')"
+          if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null && echo "已结束 PID $pid" || echo "结束失败 PID $pid"
+            killed=1
           fi
-        else
-          echo "未检测到 systemctl，无法重启服务。"
+        done
+        if [ "$killed" -eq 0 ]; then
+          echo "未结束任何进程。"
         fi
         pause
         ;;
       2)
-        if command -v systemctl >/dev/null 2>&1; then
-          if ! service_unit_exists; then
-            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
-            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
-            pause
-            continue
-          fi
-          read -r -p "确认重载 $SERVICE_UNIT 服务？[y/N] " ans
-          if [[ "$ans" =~ ^[Yy]$ ]]; then
-            sudo systemctl reload "$SERVICE_UNIT"
-          fi
+        read -r -p "确认结束全部 codex 进程？[y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          local line pid
+          for line in "${lines[@]}"; do
+            pid="$(echo "$line" | awk '{print $1}')"
+            if [ -n "$pid" ]; then
+              kill "$pid" 2>/dev/null && echo "已结束 PID $pid" || echo "结束失败 PID $pid"
+            fi
+          done
         else
-          echo "未检测到 systemctl，无法重载服务。"
-        fi
-        pause
-        ;;
-      3)
-        if command -v systemctl >/dev/null 2>&1; then
-          if ! service_unit_exists; then
-            echo "未找到 systemd 服务：${SERVICE_UNIT}.service"
-            echo "请确认 SERVICE_UNIT 设置是否正确，或使用你自己的服务名。"
-            pause
-            continue
-          fi
-          systemctl status "$SERVICE_UNIT" --no-pager
-        else
-          echo "未检测到 systemctl，无法查看服务状态。"
+          echo "已取消。"
         fi
         pause
         ;;
@@ -3352,7 +3326,7 @@ main() {
       "提示词 (Prompt) 管理" \
       "MCP (上下文协议) 管理" \
       "Skill (技能/工具) 管理" \
-      "重启/重载 Codex 服务" \
+      "Codex 进程" \
       "退出脚本")"
       if [ -z "$choice" ]; then
         continue
@@ -3363,14 +3337,14 @@ main() {
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 2 "$C_RESET" "提示词 (Prompt) 管理"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 3 "$C_RESET" "MCP (上下文协议) 管理"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 4 "$C_RESET" "Skill (技能/工具) 管理"
-        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 5 "$C_RESET" "重启/重载 Codex 服务"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 5 "$C_RESET" "Codex 进程"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 0 "$C_RESET" "退出脚本"
       else
         printf "[ %d ] %s\n" 1 "API 和模型管理"
         printf "[ %d ] %s\n" 2 "提示词 (Prompt) 管理"
         printf "[ %d ] %s\n" 3 "MCP (上下文协议) 管理"
         printf "[ %d ] %s\n" 4 "Skill (技能/工具) 管理"
-        printf "[ %d ] %s\n" 5 "重启/重载 Codex 服务"
+        printf "[ %d ] %s\n" 5 "Codex 进程"
         printf "[ %d ] %s\n" 0 "退出脚本"
       fi
       echo
