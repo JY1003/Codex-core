@@ -3316,6 +3316,44 @@ service_menu() {
   done
 }
 
+uninstall_menu() {
+  echo
+  local bin_path="/usr/local/bin/cx"
+  local target=""
+  if command -v cx >/dev/null 2>&1; then
+    if [ -L "$bin_path" ]; then
+      target="$(readlink "$bin_path")"
+    else
+      target="$(command -v cx)"
+    fi
+  fi
+  if [ -z "$target" ]; then
+    echo "未找到已安装的 cx 命令。"
+    pause
+    return
+  fi
+  local install_dir
+  install_dir="$(cd "$(dirname "$target")" && pwd)"
+  echo "检测到安装位置：$install_dir"
+  echo "将执行卸载："
+  echo "- 删除 $bin_path"
+  echo "- 删除 $install_dir"
+  read -r -p "确认卸载？[y/N] " ans
+  if ! [[ "$ans" =~ ^[Yy]$ ]]; then
+    echo "已取消。"
+    pause
+    return
+  fi
+  if [ -e "$bin_path" ]; then
+    sudo rm -f "$bin_path" || { echo "删除 $bin_path 失败。"; pause; return; }
+  fi
+  if [ -d "$install_dir" ]; then
+    rm -rf "$install_dir" || { echo "删除 $install_dir 失败。"; pause; return; }
+  fi
+  echo "卸载完成。"
+  pause
+}
+
 main() {
   while true; do
     dashboard
@@ -3327,6 +3365,7 @@ main() {
       "MCP (上下文协议) 管理" \
       "Skill (技能/工具) 管理" \
       "Codex 进程" \
+      "卸载脚本" \
       "退出脚本")"
       if [ -z "$choice" ]; then
         continue
@@ -3338,6 +3377,7 @@ main() {
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 3 "$C_RESET" "MCP (上下文协议) 管理"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 4 "$C_RESET" "Skill (技能/工具) 管理"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 5 "$C_RESET" "Codex 进程"
+        printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 6 "$C_RESET" "卸载脚本"
         printf "[ %s%d%s ] %s\n" "$C_BOLD$C_MAGENTA" 0 "$C_RESET" "退出脚本"
       else
         printf "[ %d ] %s\n" 1 "API 和模型管理"
@@ -3345,10 +3385,11 @@ main() {
         printf "[ %d ] %s\n" 3 "MCP (上下文协议) 管理"
         printf "[ %d ] %s\n" 4 "Skill (技能/工具) 管理"
         printf "[ %d ] %s\n" 5 "Codex 进程"
+        printf "[ %d ] %s\n" 6 "卸载脚本"
         printf "[ %d ] %s\n" 0 "退出脚本"
       fi
       echo
-      read -r -p "codex-core $(prompt_symbol) 请输入对应数字选择 [0-5]: " choice
+      read -r -p "codex-core $(prompt_symbol) 请输入对应数字选择 [0-6]: " choice
       if [ -z "$choice" ]; then
         continue
       fi
@@ -3359,6 +3400,7 @@ main() {
       3) mcp_menu ;;
       4) skill_menu ;;
       5) service_menu ;;
+      6) uninstall_menu ;;
       0) echo "退出脚本。"; exit 0 ;;
       *) echo "无效选择。" ;;
     esac
