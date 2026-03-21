@@ -110,6 +110,24 @@ warn_missing_deps() {
   fi
 }
 
+print_stdout() {
+  local msg="$1"
+  if [ -w /dev/tty ]; then
+    printf "%s\n" "$msg" >/dev/tty
+  else
+    printf "%s\n" "$msg"
+  fi
+}
+
+print_stderr() {
+  local msg="$1"
+  if [ -w /dev/tty ]; then
+    printf "%s\n" "$msg" >/dev/tty
+  else
+    printf "%s\n" "$msg" >&2
+  fi
+}
+
 pick_install_dir() {
   if [ -n "${INSTALL_DIR:-}" ]; then
     echo "$INSTALL_DIR"
@@ -131,22 +149,10 @@ ask_install_dir() {
   local current_dir recommended choice custom_dir
   current_dir="$(pwd)"
   recommended="$(pick_install_dir)"
-  local tty="/dev/tty"
-  local has_tty=0
-  if [ -w "$tty" ]; then
-    has_tty=1
-  fi
-  if [ "$has_tty" -eq 1 ]; then
-    printf "%s\n" "请选择安装路径（回车默认当前路径）：" >"$tty"
-    printf "%s\n" "  1) 当前路径：$current_dir" >"$tty"
-    printf "%s\n" "  2) 自定义路径" >"$tty"
-    printf "%s\n" "  3) 推荐路径：$recommended" >"$tty"
-  else
-    printf "%s\n" "请选择安装路径（回车默认当前路径）："
-    printf "%s\n" "  1) 当前路径：$current_dir"
-    printf "%s\n" "  2) 自定义路径"
-    printf "%s\n" "  3) 推荐路径：$recommended"
-  fi
+  print_stdout "请选择安装路径（回车默认当前路径）："
+  print_stdout "  1) 当前路径：$current_dir"
+  print_stdout "  2) 自定义路径"
+  print_stdout "  3) 推荐路径：$recommended"
   if ! read -r -p "选择 [1-3，默认 1]: " choice </dev/tty; then
     choice=""
   fi
@@ -171,15 +177,52 @@ ask_install_dir() {
       return 0
       ;;
     *)
-      if [ "$has_tty" -eq 1 ]; then
-        printf "%s\n" "无效选择，默认使用当前路径：$current_dir" >"$tty"
-      else
-        printf "%s\n" "无效选择，默认使用当前路径：$current_dir"
-      fi
+      print_stdout "无效选择，默认使用当前路径：$current_dir"
       echo "$current_dir"
       return 0
       ;;
   esac
+}
+
+ensure_path_for_bash() {
+  local dir="$1"
+  local home_path="${HOME:-}"
+  local target=""
+  local line=""
+  local confirm=""
+  if [ -z "$home_path" ]; then
+    return 0
+  fi
+  if echo "$PATH" | tr ':' '\n' | grep -Fx "$dir" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -w "$home_path/.bashrc" ] || [ ! -e "$home_path/.bashrc" ]; then
+    target="$home_path/.bashrc"
+  elif [ -w "$home_path/.bash_profile" ] || [ ! -e "$home_path/.bash_profile" ]; then
+    target="$home_path/.bash_profile"
+  elif [ -w "$home_path/.profile" ] || [ ! -e "$home_path/.profile" ]; then
+    target="$home_path/.profile"
+  else
+    print_stderr "注意：无法写入 PATH，缺少可写的 bash 配置文件。"
+    return 0
+  fi
+
+  print_stdout "检测到安装路径不在 PATH 中：$dir"
+  if ! read -r -p "是否自动写入 PATH 到 $target ？[y/N] " confirm </dev/tty; then
+    confirm=""
+  fi
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    line="export PATH=\"$dir:\$PATH\""
+    if [ -f "$target" ] && grep -Fqx "$line" "$target" 2>/dev/null; then
+      print_stdout "已存在 PATH 配置，未重复写入。"
+      return 0
+    fi
+    printf "\n%s\n" "$line" >>"$target"
+    print_stdout "已写入 PATH：$target"
+    print_stdout "当前终端可执行：source $target"
+  else
+    print_stdout "已跳过写入 PATH。"
+  fi
 }
 
 script_source="${BASH_SOURCE[0]-$0}"
@@ -237,6 +280,4 @@ fi
 echo "已安装：$install_path"
 echo "已创建命令：$install_dir/$ALIAS_NAME"
 
-if ! echo "$PATH" | tr ':' '\n' | grep -Fx "$install_dir" >/dev/null 2>&1; then
-  echo "注意：$install_dir 不在 PATH 中。请将其加入 PATH 或使用全路径运行。"
-fi
+ensure_path_for_bash "$install_dir"
