@@ -131,10 +131,22 @@ ask_install_dir() {
   local current_dir recommended choice custom_dir
   current_dir="$(pwd)"
   recommended="$(pick_install_dir)"
-  echo "请选择安装路径（回车默认当前路径）："
-  echo "  1) 当前路径：$current_dir"
-  echo "  2) 自定义路径"
-  echo "  3) 推荐路径：$recommended"
+  local tty="/dev/tty"
+  local has_tty=0
+  if [ -w "$tty" ]; then
+    has_tty=1
+  fi
+  if [ "$has_tty" -eq 1 ]; then
+    printf "%s\n" "请选择安装路径（回车默认当前路径）：" >"$tty"
+    printf "%s\n" "  1) 当前路径：$current_dir" >"$tty"
+    printf "%s\n" "  2) 自定义路径" >"$tty"
+    printf "%s\n" "  3) 推荐路径：$recommended" >"$tty"
+  else
+    printf "%s\n" "请选择安装路径（回车默认当前路径）："
+    printf "%s\n" "  1) 当前路径：$current_dir"
+    printf "%s\n" "  2) 自定义路径"
+    printf "%s\n" "  3) 推荐路径：$recommended"
+  fi
   if ! read -r -p "选择 [1-3，默认 1]: " choice </dev/tty; then
     choice=""
   fi
@@ -159,7 +171,11 @@ ask_install_dir() {
       return 0
       ;;
     *)
-      echo "无效选择，默认使用当前路径：$current_dir"
+      if [ "$has_tty" -eq 1 ]; then
+        printf "%s\n" "无效选择，默认使用当前路径：$current_dir" >"$tty"
+      else
+        printf "%s\n" "无效选择，默认使用当前路径：$current_dir"
+      fi
       echo "$current_dir"
       return 0
       ;;
