@@ -184,35 +184,61 @@ ask_install_dir() {
   esac
 }
 
-ensure_path_for_bash() {
-  local dir="$1"
+detect_shell_profile() {
+  local shell_name="$1"
   local home_path="${HOME:-}"
-  local target=""
-  local line=""
-  local confirm=""
   if [ -z "$home_path" ]; then
+    echo ""
     return 0
   fi
+  case "$shell_name" in
+    zsh)
+      if [ -w "$home_path/.zshrc" ] || [ ! -e "$home_path/.zshrc" ]; then
+        echo "$home_path/.zshrc"
+        return 0
+      fi
+      ;;
+    bash|*)
+      if [ -w "$home_path/.bashrc" ] || [ ! -e "$home_path/.bashrc" ]; then
+        echo "$home_path/.bashrc"
+        return 0
+      fi
+      if [ -w "$home_path/.bash_profile" ] || [ ! -e "$home_path/.bash_profile" ]; then
+        echo "$home_path/.bash_profile"
+        return 0
+      fi
+      if [ -w "$home_path/.profile" ] || [ ! -e "$home_path/.profile" ]; then
+        echo "$home_path/.profile"
+        return 0
+      fi
+      ;;
+  esac
+  echo ""
+}
+
+ensure_path_for_shell() {
+  local dir="$1"
   if echo "$PATH" | tr ':' '\n' | grep -Fx "$dir" >/dev/null 2>&1; then
     return 0
   fi
-  if [ -w "$home_path/.bashrc" ] || [ ! -e "$home_path/.bashrc" ]; then
-    target="$home_path/.bashrc"
-  elif [ -w "$home_path/.bash_profile" ] || [ ! -e "$home_path/.bash_profile" ]; then
-    target="$home_path/.bash_profile"
-  elif [ -w "$home_path/.profile" ] || [ ! -e "$home_path/.profile" ]; then
-    target="$home_path/.profile"
-  else
-    print_stderr "注意：无法写入 PATH，缺少可写的 bash 配置文件。"
+  local shell_name="bash"
+  if echo "${SHELL:-}" | grep -q "zsh"; then
+    shell_name="zsh"
+  fi
+  local target
+  target="$(detect_shell_profile "$shell_name")"
+  if [ -z "$target" ]; then
+    print_stderr "注意：无法写入 PATH，缺少可写的 shell 配置文件。"
     return 0
   fi
 
   print_stdout "检测到安装路径不在 PATH 中：$dir"
+  local confirm
   if ! read -r -p "是否自动写入 PATH 到 $target ？[y/N] " confirm </dev/tty; then
     confirm=""
   fi
   if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    line="export PATH=\"$dir:\$PATH\""
+    local line="export PATH=\"$dir:\$PATH\""
     if [ -f "$target" ] && grep -Fqx "$line" "$target" 2>/dev/null; then
       print_stdout "已存在 PATH 配置，未重复写入。"
       return 0
@@ -280,4 +306,4 @@ fi
 echo "已安装：$install_path"
 echo "已创建命令：$install_dir/$ALIAS_NAME"
 
-ensure_path_for_bash "$install_dir"
+ensure_path_for_shell "$install_dir"
