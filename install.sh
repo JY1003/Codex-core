@@ -135,14 +135,18 @@ ask_install_dir() {
   echo "  1) 当前路径：$current_dir"
   echo "  2) 自定义路径"
   echo "  3) 推荐路径：$recommended"
-  read -r -p "选择 [1-3，默认 1]: " choice
+  if ! read -r -p "选择 [1-3，默认 1]: " choice </dev/tty; then
+    choice=""
+  fi
   case "$choice" in
     ""|1)
       echo "$current_dir"
       return 0
       ;;
     2)
-      read -r -p "请输入自定义安装路径（留空取消，回退当前路径）: " custom_dir
+      if ! read -r -p "请输入自定义安装路径（留空取消，回退当前路径）: " custom_dir </dev/tty; then
+        custom_dir=""
+      fi
       if [ -n "$custom_dir" ]; then
         echo "$custom_dir"
       else
