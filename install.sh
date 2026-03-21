@@ -127,9 +127,53 @@ pick_install_dir() {
   echo "/tmp"
 }
 
+ask_install_dir() {
+  local current_dir recommended choice custom_dir
+  current_dir="$(pwd)"
+  recommended="$(pick_install_dir)"
+  echo "请选择安装路径（回车默认当前路径）："
+  echo "  1) 当前路径：$current_dir"
+  echo "  2) 自定义路径"
+  echo "  3) 推荐路径：$recommended"
+  read -r -p "选择 [1-3，默认 1]: " choice
+  case "$choice" in
+    ""|1)
+      echo "$current_dir"
+      return 0
+      ;;
+    2)
+      read -r -p "请输入自定义安装路径（留空取消，回退当前路径）: " custom_dir
+      if [ -n "$custom_dir" ]; then
+        echo "$custom_dir"
+      else
+        echo "$current_dir"
+      fi
+      return 0
+      ;;
+    3)
+      echo "$recommended"
+      return 0
+      ;;
+    *)
+      echo "无效选择，默认使用当前路径：$current_dir"
+      echo "$current_dir"
+      return 0
+      ;;
+  esac
+}
+
 script_source="${BASH_SOURCE[0]-$0}"
 script_dir="$(cd "$(dirname "$script_source")" && pwd)"
-install_dir="$(pick_install_dir)"
+install_dir="$(ask_install_dir)"
+if [ -n "$install_dir" ]; then
+  mkdir -p "$install_dir" 2>/dev/null || true
+fi
+if [ ! -w "$install_dir" ]; then
+  echo "警告：安装路径不可写：$install_dir"
+  echo "将回退为推荐路径。"
+  install_dir="$(pick_install_dir)"
+  mkdir -p "$install_dir" 2>/dev/null || true
+fi
 
 missing_deps="$(collect_missing_deps)"
 missing_deps="$(printf "%s" "$missing_deps" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
