@@ -1505,10 +1505,14 @@ select_model_or_name() {
 
 filter_codex_models() {
   local models=("$@")
+  local gpt=()
   local gpt_codex=()
   local codex=()
   local m
   for m in "${models[@]}"; do
+    if [[ "$m" == *gpt* ]] || [[ "$m" == *GPT* ]]; then
+      gpt+=( "$m" )
+    fi
     if [[ "$m" == *codex* ]] || [[ "$m" == *Codex* ]]; then
       codex+=( "$m" )
       if [[ "$m" == *gpt* ]] || [[ "$m" == *GPT* ]]; then
@@ -1516,7 +1520,9 @@ filter_codex_models() {
       fi
     fi
   done
-  if [ "${#gpt_codex[@]}" -gt 0 ]; then
+  if [ "${#gpt[@]}" -gt 0 ]; then
+    printf '%s\n' "${gpt[@]}"
+  elif [ "${#gpt_codex[@]}" -gt 0 ]; then
     printf '%s\n' "${gpt_codex[@]}"
   elif [ "${#codex[@]}" -gt 0 ]; then
     printf '%s\n' "${codex[@]}"
